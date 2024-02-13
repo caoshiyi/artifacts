@@ -1,0 +1,8 @@
+# Environments
+env/
+
+# Python files
+__pycache__/
+
+# Generated Jupyter Notebook files
+.ipynb_checkpoints/
