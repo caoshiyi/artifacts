@@ -89,8 +89,12 @@ class QueryTrace:
         return len(np.unique(exp_ids_flat))
 
     @functools.cached_property
+    def num_selected_experts(self) -> int:
+        return len(self.expert_ids[0][0])
+
+    @functools.cached_property
     def num_tokens(self) -> int:
-        return sum(len(x) for x in self.input_ids)
+        return sum(len(x) for x in self.input_ids[:: self.num_layers])
 
     @functools.cached_property
     def prompt_token_length(self) -> int:
@@ -98,7 +102,7 @@ class QueryTrace:
 
     @functools.cached_property
     def num_generated_tokens(self) -> int:
-        return len(self.input_ids[1:])
+        return len(self.input_ids[1:]) // self.num_layers
 
     def expert_counts_by_layer(self) -> np.ndarray:
         expert_counts_by_layer = np.zeros(
@@ -111,6 +115,22 @@ class QueryTrace:
             )
 
         return expert_counts_by_layer
+
+    def experts_per_token(self) -> np.ndarray:
+        """Returns a 3D array of (num_tokens, num_layers, num_selected_experts)."""
+        result = np.zeros(
+            (self.num_tokens, self.num_layers, self.num_selected_experts),
+            dtype=np.uint32,
+        )
+        token_idx = 0
+        d_token_idx = 0
+        for layer_id, expert_ids in zip(self.layer_ids, self.expert_ids):
+            if layer_id == 0:
+                token_idx += d_token_idx
+                d_token_idx = len(expert_ids)
+            for i, experts in enumerate(expert_ids):
+                result[token_idx + i, layer_id] = experts
+        return result
 
     def without_prefix(self) -> "QueryTrace":
         return QueryTrace(
