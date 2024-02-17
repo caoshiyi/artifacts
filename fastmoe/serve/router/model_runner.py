@@ -8,25 +8,22 @@ from typing import List
 import numpy as np
 import torch
 from fastmoe.serve.router.infer_batch import Batch, ForwardMode
-from fastmoe.managers.memory import ReqToTokenPool, TokenToKVPool
+from fastmoe.backend.memory import ReqToTokenPool, TokenToKVPool
 from fastmoe.utils.utils import get_available_gpu_memory
 from vllm.model_executor.model_loader import _set_default_torch_dtype
 from vllm.model_executor.parallel_utils.parallel_state import initialize_model_parallel
 
-import sglang
+import fastmoe
 
 logger = logging.getLogger("model_runner")
 
-
-# for model_mode
-global_model_mode: List[str] = []
 
 
 @lru_cache()
 def import_model_classes():
     model_arch_name_to_cls = {}
-    for module_path in (Path(sglang.__file__).parent / "srt" / "models").glob("*.py"):
-        module = importlib.import_module(f"sglang.srt.models.{module_path.stem}")
+    for module_path in (Path(fastmoe.__file__).parent / "models").glob("*.py"):
+        module = importlib.import_module(f"fastmoe.models.{module_path.stem}")
         if hasattr(module, "EntryClass"):
             model_arch_name_to_cls[module.EntryClass.__name__] = module.EntryClass
     return model_arch_name_to_cls
@@ -144,7 +141,6 @@ class ModelRunner:
         nccl_port,
         load_format="auto",
         trust_remote_code=True,
-        model_mode: List[str] = (),
     ):
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -153,10 +149,6 @@ class ModelRunner:
         self.nccl_port = nccl_port
         self.load_format = load_format
         self.trust_remote_code = trust_remote_code
-        self.model_mode = model_mode
-
-        global global_model_mode
-        global_model_mode = model_mode
 
         # Init torch distributed
         torch.cuda.set_device(self.tp_rank)

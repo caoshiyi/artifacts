@@ -22,7 +22,6 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.layer_id = layer_id
 
-        from fastmoe.serve.router.model_runner import global_model_mode
         self.prefill_forward = self.prefill_forward_triton
         self.decode_forward = self.decode_forward_triton
 

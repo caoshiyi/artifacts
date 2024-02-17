@@ -1,4 +1,3 @@
-"""SRT: SGLang Runtime"""
 import asyncio
 import json
 import multiprocessing as mp
@@ -18,8 +17,7 @@ import uvicorn
 import uvloop
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.conversation import (
+from fastmoe.serve.conversation import (
     Conversation,
     SeparatorStyle,
     chat_template_exists,
@@ -44,10 +42,10 @@ from fastmoe.serve.openai_protocol import (
     DeltaMessage,
     UsageInfo,
 )
-from sglang.srt.managers.router.manager import start_router_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import alloc_usable_network_port, handle_port_init
+from fastmoe.serve.router.manager import start_router_process
+from fastmoe.serve.tokenizer_manager import TokenizerManager
+from fastmoe.serve.server_args import PortArgs, ServerArgs
+from fastmoe.utils.utils import handle_port_init
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -61,24 +59,6 @@ chat_template_name = None
 async def health() -> Response:
     """Health check."""
     return Response(status_code=200)
-
-
-@app.get("/get_model_info")
-async def get_model_info():
-    result = {
-        "model_path": tokenizer_manager.model_path,
-    }
-    return result
-
-
-@app.get("/flush_cache")
-async def flush_cache():
-    await tokenizer_manager.flush_cache()
-    return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n",
-        status_code=200,
-    )
-
 
 async def stream_generator(obj):
     async for out in tokenizer_manager.generate_request(obj):
@@ -107,7 +87,6 @@ async def v1_completions(raw_request: Request):
     request_json = await raw_request.json()
     request = CompletionRequest(**request_json)
 
-    # TODO: Validate the request and return HTTPStatus.BAD_REQUEST if invalid.
     assert request.n == 1
 
     adapted_request = GenerateReqInput(
@@ -164,7 +143,7 @@ async def v1_completions(raw_request: Request):
         index=0,
         text=ret["text"],
         logprobs=None,
-        finish_reason=None,  # TODO(comaniac): Add finish reason.
+        finish_reason=None,
     )
 
     prompt_tokens = ret["meta_info"]["prompt_tokens"]
@@ -187,7 +166,6 @@ async def v1_chat_completions(raw_request: Request):
     request_json = await raw_request.json()
     request = ChatCompletionRequest(**request_json)
 
-    # TODO: Validate the request and return HTTPStatus.BAD_REQUEST if invalid.
     assert request.n == 1
 
     # Prep the data needed for the underlying GenerateReqInput:
@@ -287,7 +265,7 @@ async def v1_chat_completions(raw_request: Request):
     choice_data = ChatCompletionResponseChoice(
         index=0,
         message=ChatMessage(role="assistant", content=ret["text"]),
-        finish_reason=None,  # TODO(comaniac): Add finish reason.
+        finish_reason=None,
     )
     response = ChatCompletionResponse(
         id=ret["meta_info"]["id"],
@@ -433,8 +411,6 @@ class Runtime:
         mem_fraction_static: float = ServerArgs.mem_fraction_static,
         max_prefill_num_token: int = ServerArgs.max_prefill_num_token,
         tp_size: int = 1,
-        model_mode: List[str] = (),
-        schedule_heuristic: str = "lpm",
         random_seed: int = 42,
         log_level: str = "error",
         port: Optional[int] = None,
@@ -454,8 +430,6 @@ class Runtime:
             mem_fraction_static=mem_fraction_static,
             max_prefill_num_token=max_prefill_num_token,
             tp_size=tp_size,
-            model_mode=model_mode,
-            schedule_heuristic=schedule_heuristic,
             random_seed=random_seed,
             log_level=log_level,
         )

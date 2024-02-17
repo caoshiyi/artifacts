@@ -5,37 +5,59 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-class ExpertPool:
-    def __init__(self, size, dtype, head_num, head_dim, layer_num):
-        self.mem_state = torch.zeros((size,), dtype=torch.int16, device="cuda")
+class MemoryPool:
+    def __init__(self, size, dtype, shape, pool_name, num_pool=1):
+        self.mem_state = torch.zeros((size,), dtype=dtype, device="cuda")
+        self.pool_name = pool_name
         self.alloc_ct = 0
 
-        # [size, head_num, head_dim] for each layer
-        self.expert_data = [
-            torch.empty((size, head_num, head_dim), dtype=dtype, device="cuda")
-            for _ in range(layer_num)
-        ]
-        
-        # mapping from expert (expert_id, layer_id) to pool index
-        self.expert_to_index = {}
-        
+        self.mem_data = torch.empty((size, shape), dtype=dtype, device="cuda")  
 
-    def get_expert_buffer(self, layer_id, expert_id):
-        if (layer_id, expert_id) not in self.expert_to_index:
+    def alloc(self, need_size):
+        select_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:need_size]
+        if select_index.shape[0] < need_size:
             return None
-        return self.expert_data[self.expert_to_index[(layer_id, expert_id)]]
 
-    def alloc(self, expert_id, layer_id):
-        select_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:1]
-
-        self.expert_to_index[(layer_id, expert_id)] = select_index.item()
+        self.add_refs(select_index)
         return select_index.to(torch.int32)
+
+    def alloc_contiguous(self, need_size):
+        empty_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:need_size]
+        if empty_index.shape[0] < need_size:
+            return None
+        empty_size = len(empty_index)
+        loc_sum = (
+            empty_index[need_size - 1 :] - empty_index[: empty_size - (need_size - 1)]
+        )
+        can_used_loc = empty_index[: empty_size - (need_size - 1)][
+            loc_sum == need_size - 1
+        ]
+        if can_used_loc.shape[0] == 0:
+            return None
+        start_loc = can_used_loc[0].item()
+        select_index = torch.arange(start_loc, start_loc + need_size, device="cuda")
+        self.add_refs(select_index)
+        return select_index.to(torch.int32), start_loc, start_loc + need_size
+
+    def free(self, free_index):
+        return self.decrease_refs(free_index)
 
     def used_size(self):
         return len(torch.nonzero(self.mem_state).squeeze(1))
 
     def available_size(self):
         return torch.sum(self.mem_state == 0).item()
+
+    def add_refs(self, token_index: torch.Tensor):
+        self.alloc_ct += len(token_index)
+        self.mem_state[token_index] += 1
+
+    def decrease_refs(self, token_index: torch.Tensor):
+        self.alloc_ct -= len(token_index)
+        self.mem_state[token_index] -= 1
+
+        num_freed = torch.sum(self.mem_state[token_index] == 0)
+        return num_freed
 
     def clear(self):
         self.mem_state.fill_(0)

@@ -20,7 +20,7 @@ class LogitsProcessor(nn.Module):
             else:
                 last_index = (
                     torch.cumsum(
-                        input_metadata.seq_lens - input_metadata.prefix_lens,
+                        input_metadata.seq_lens,
                         dim=0,
                         dtype=torch.long,
                     )
@@ -38,7 +38,7 @@ class LogitsProcessor(nn.Module):
             assert input_metadata.forward_mode != ForwardMode.DECODE
             last_index = (
                 torch.cumsum(
-                    input_metadata.seq_lens - input_metadata.prefix_lens,
+                    input_metadata.seq_lens,
                     dim=0,
                     dtype=torch.long,
                 )

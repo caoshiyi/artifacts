@@ -17,8 +17,6 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_prefill_num_token: Optional[int] = None
     tp_size: int = 1
-    model_mode: List[str] = ()
-    schedule_heuristic: str = "lpm"
     schedule_conservativeness: float = 1.0
     random_seed: int = 42
     stream_interval: int = 8
@@ -128,12 +126,6 @@ class ServerArgs:
             nargs="+",
             choices=["flashinfer", "no-cache"],
             help="Model mode: [flashinfer, no-cache]",
-        )
-        parser.add_argument(
-            "--schedule-heuristic",
-            type=str,
-            default=ServerArgs.schedule_heuristic,
-            help="Schudule mode: [lpm, weight, random, fcfs]",
         )
         parser.add_argument(
             "--schedule-conservativeness",

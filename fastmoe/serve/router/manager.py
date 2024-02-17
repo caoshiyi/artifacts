@@ -36,12 +36,6 @@ class RouterManager:
             for obj in out_pyobjs:
                 self.send_to_detokenizer.send_pyobj(obj)
 
-            # async sleep for receiving the subsequent request and avoiding cache miss
-            if len(out_pyobjs) != 0:
-                has_finished = any([obj.finished for obj in out_pyobjs])
-                if has_finished:
-                    await asyncio.sleep(self.extend_dependency_time)
-
             await asyncio.sleep(0.0006)
 
     async def loop_for_recv_requests(self):

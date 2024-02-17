@@ -41,10 +41,8 @@ class ModelRpcServer(rpyc.Service):
         server_args, port_args = [obtain(x) for x in [server_args, port_args]]
 
         # Copy arguments
-        self.model_mode = server_args.model_mode
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
-        self.schedule_heuristic = server_args.schedule_heuristic
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -58,7 +56,6 @@ class ModelRpcServer(rpyc.Service):
             port_args.nccl_port,
             server_args.load_format,
             server_args.trust_remote_code,
-            server_args.model_mode,
         )
         
         self.tokenizer = get_tokenizer(
@@ -84,11 +81,9 @@ class ModelRpcServer(rpyc.Service):
             f"max_total_num_token={self.max_total_num_token}, "
             f"max_prefill_num_token={self.max_prefill_num_token}, "
             f"context_len={self.model_config.context_len}, "
-            f"model_mode={self.model_mode}"
         )
         
         self.scheduler = Scheduler(
-            self.schedule_heuristic,
             self.max_num_running_seq,
             self.max_prefill_num_token,
             self.max_total_num_token,
@@ -347,7 +342,6 @@ class ModelRpcServer(rpyc.Service):
     def handle_finished_requests(self, batch: Batch):
         output_rids = []
         output_tokens = []
-        output_and_fast_forward_strs = []
         output_hit_stop_str = []
         output_skip_special_tokens = []
         output_meta_info = []
@@ -371,7 +365,6 @@ class ModelRpcServer(rpyc.Service):
             ):
                 output_rids.append(req.rid)
                 output_tokens.append(req.output_ids)
-                output_and_fast_forward_strs.append(req.output_and_fast_forward_str)
                 output_hit_stop_str.append(req.hit_stop_str)
                 output_skip_special_tokens.append(
                     req.sampling_params.skip_special_tokens
@@ -392,7 +385,6 @@ class ModelRpcServer(rpyc.Service):
                 BatchTokenIDOut(
                     output_rids,
                     output_tokens,
-                    output_and_fast_forward_strs,
                     output_hit_stop_str,
                     output_skip_special_tokens,
                     output_meta_info,

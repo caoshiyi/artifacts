@@ -4,7 +4,7 @@ from typing import List
 
 import numpy as np
 import torch
-from fastmoe.managers.memory import ReqToTokenPool, TokenToKVPool
+from fastmoe.backend.memory import ReqToTokenPool, TokenToKVPool
 
 
 class ForwardMode(Enum):
@@ -104,7 +104,7 @@ class Batch:
     logit_bias: torch.Tensor = None
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
@@ -236,7 +236,6 @@ class Batch:
 
             if self.out_cache_loc is None:
                 print("Decode out of memory. This should nerver happen.")
-                self.tree_cache.pretty_print()
                 exit()
 
             self.out_cache_cont_start = None

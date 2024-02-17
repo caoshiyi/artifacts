@@ -2,7 +2,7 @@ import os
 from typing import Optional, Union
 
 import torch
-from sglang.srt.hf_transformers_utils import get_config, get_context_length
+from fastmoe.utils.hf_transformers_utils import get_config, get_context_length
 
 
 class ModelConfig:

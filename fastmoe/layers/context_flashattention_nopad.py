@@ -3,7 +3,7 @@
 import torch
 import triton
 import triton.language as tl
-from fastmoe.utils import wrap_kernel_launcher
+from fastmoe.utils.utils import wrap_kernel_launcher
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
