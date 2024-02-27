@@ -7,11 +7,12 @@ logger = logging.getLogger(__name__)
 
 class MemoryPool:
     def __init__(self, size, dtype, shape, pool_name, num_pool=1):
-        self.mem_state = torch.zeros((size,), dtype=dtype, device="cuda")
+        self.mem_state = torch.zeros((size,), dtype=torch.int16, device="cuda")
         self.pool_name = pool_name
         self.alloc_ct = 0
+        self.size = size
 
-        self.mem_data = torch.empty((size, shape), dtype=dtype, device="cuda")  
+        self.mem_data = torch.empty((size, shape), dtype=dtype, device="cuda")
 
     def alloc(self, need_size):
         select_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:need_size]
@@ -65,12 +66,17 @@ class MemoryPool:
 
 
 class ReqToTokenPool:
-    def __init__(self, size, max_context_len):
+    def __init__(self, size, max_context_len, num_layers, device="cuda"):
         self.mem_state = torch.ones((size,), dtype=torch.bool, device="cuda")
         self.can_use_mem_size = size
-        self.req_to_token = torch.empty(
-            (size, max_context_len), dtype=torch.int32, device="cuda"
-        )
+        if device == "cuda":
+            self.req_to_token = torch.empty(
+                (size, num_layers, max_context_len), dtype=torch.int32, device="cuda"
+            )
+        else:
+            self.req_to_token = torch.empty(
+                (size, max_context_len), dtype=torch.int32, device="cpu"
+            )
 
     def alloc(self, need_size):
         if need_size > self.can_use_mem_size:
@@ -97,32 +103,69 @@ class ReqToTokenPool:
 
 
 class TokenToKVPool:
-    def __init__(self, size, dtype, head_num, head_dim, layer_num):
-        self.mem_state = torch.zeros((size,), dtype=torch.int16, device="cuda")
+    def __init__(self, gpu_size, cpu_size, dtype, head_num, head_dim, layer_num):
+        self.gpu_mem_state = torch.zeros((gpu_size,), dtype=torch.int16, device="cuda")
+        self.cpu_mem_state = torch.zeros((cpu_size,), dtype=torch.int16, device="cpu")
         self.alloc_ct = 0
+        self.alloc_ct_cpu = 0
 
         # [size, key/value, head_num, head_dim] for each layer
-        self.kv_data = [
-            torch.empty((size, 2, head_num, head_dim), dtype=dtype, device="cuda")
+        self.kv_data = torch.empty((gpu_size, 2, head_num, head_dim), dtype=dtype, device="cuda")
+        
+
+        self.kv_data_cpu = [
+            torch.empty((cpu_size, 2, head_num, head_dim), dtype=dtype, device="cpu")
             for _ in range(layer_num)
         ]
 
-    def get_key_buffer(self, layer_id):
-        return self.kv_data[layer_id][:, 0]
+    # gpu_indices: [num_layer, num_token], cpu_indices: [num_token]
+    def offload_kv_cache(self, gpu_indices, cpu_indices=None, start_layer=0):
+        if cpu_indices is None:
+            need_size = gpu_indices.shape[1] # num_token
+            select_index = torch.nonzero(self.cpu_mem_state == 0).squeeze(1)[:need_size]
+            assert select_index.shape[0] >= need_size
+            self.cpu_mem_state[select_index] += 1
+            self.gpu_mem_state[gpu_indices.flatten()] -= 1
+            self.alloc_ct_cpu += need_size
+            for layer in range(gpu_indices.shape[0]):
+                self.kv_data_cpu[layer][select_index].copy_(self.kv_data[gpu_indices[layer, :]])
+            return select_index
+        else:
+            self.gpu_mem_state[gpu_indices.flatten()] -= 1
+            for layer in range(gpu_indices.shape[0]):
+                self.kv_data_cpu[start_layer+layer][cpu_indices].copy_(self.kv_data[gpu_indices[layer, :]])
+            return cpu_indices
 
-    def get_value_buffer(self, layer_id):
-        return self.kv_data[layer_id][:, 1]
+
+    def load_kv_cache(self, cpu_indices, layer_ids):
+        need_size = len(cpu_indices) * len(layer_ids) #num_token * num_layer
+        select_index = torch.nonzero(self.gpu_mem_state == 0).squeeze(1)[:need_size]
+        assert select_index.shape[0] >= need_size
+        select_index = select_index.view(len(layer_ids), len(cpu_indices))
+        self.gpu_mem_state[select_index] += 1
+        for i, layer in enumerate(layer_ids):
+            self.kv_data[select_index[i, :]].copy_(self.kv_data_cpu[layer][cpu_indices])
+        
+        self.add_refs(select_index)
+        return select_index.to(torch.int32)
+
+    def get_key_buffer(self):
+        return self.kv_data[:, 0]
+
+    def get_value_buffer(self):
+        return self.kv_data[:, 1]
 
     def alloc(self, need_size):
-        select_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:need_size]
+        select_index = torch.nonzero(self.gpu_mem_state == 0).squeeze(1)[:need_size]
         if select_index.shape[0] < need_size:
             return None
 
         self.add_refs(select_index)
         return select_index.to(torch.int32)
 
+    # todo, alloc_multi_contiguous
     def alloc_contiguous(self, need_size):
-        empty_index = torch.nonzero(self.mem_state == 0).squeeze(1)[:need_size]
+        empty_index = torch.nonzero(self.gpu_mem_state == 0).squeeze(1)[:need_size]
         if empty_index.shape[0] < need_size:
             return None
         empty_size = len(empty_index)
@@ -144,20 +187,23 @@ class TokenToKVPool:
         return self.decrease_refs(free_index)
 
     def used_size(self):
-        return len(torch.nonzero(self.mem_state).squeeze(1))
+        return len(torch.nonzero(self.gpu_mem_state).squeeze(1))
 
     def available_size(self):
-        return torch.sum(self.mem_state == 0).item()
+        return torch.sum(self.gpu_mem_state == 0).item()
+    
+    def cpu_available_size(self):
+        return torch.sum(self.cpu_mem_state == 0).item()
 
     def add_refs(self, token_index: torch.Tensor):
         self.alloc_ct += len(token_index)
-        self.mem_state[token_index] += 1
+        self.gpu_mem_state[token_index] += 1
 
     def decrease_refs(self, token_index: torch.Tensor):
         self.alloc_ct -= len(token_index)
-        self.mem_state[token_index] -= 1
+        self.gpu_mem_state[token_index] -= 1
 
-        num_freed = torch.sum(self.mem_state[token_index] == 0)
+        num_freed = torch.sum(self.gpu_mem_state[token_index] == 0)
 
         # if self.alloc_ct == 0:
         #     print(f"TokenToKVPool: freed all. size = {len(self.mem_state)}.")
@@ -165,5 +211,7 @@ class TokenToKVPool:
         return num_freed
 
     def clear(self):
-        self.mem_state.fill_(0)
+        self.gpu_mem_state.fill_(0)
+        self.cpu_mem_state.fill_(0)
         self.alloc_ct = 0
+        self.alloc_ct_cpu = 0

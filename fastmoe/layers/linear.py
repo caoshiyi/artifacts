@@ -70,6 +70,110 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return F.linear(x, weight) + bias
             return F.linear(x, weight)
         return F.linear(x, weight, bias)
+
+class StackedUnquantizedLinearMethod(LinearMethodBase):
+    """Linear method without quantization.
+
+    Args:
+        separate_bias_add: If true, add bias separately after matrix
+                           multiplication.
+    """
+
+    def __init__(self, separate_bias_add: bool = False):
+        self.separate_bias_add = separate_bias_add
+
+    def create_weights(self, num_layers, input_size_per_partition: int,
+                       output_size_per_partition: int, input_size: int,
+                       output_size: int,
+                       params_dtype: torch.dtype, device='cuda') -> Dict[str, Any]:
+        weight = Parameter(torch.empty(num_layers, output_size_per_partition,
+                                       input_size_per_partition,
+                                       dtype=params_dtype, device=device),
+                           requires_grad=False)
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight, {
+            "weight_loader": self.weight_loader,
+        })
+        return {"weight": weight}
+    
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor,
+                    layer_id: int):
+        param_data = param.data
+        param_data[layer_id] = loaded_weight
+
+    def apply_weights(self,
+                      index: int,
+                      weights: Dict[str, torch.Tensor],
+                      x: torch.Tensor,
+                      bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        weight = weights["weight"][index]
+        if self.separate_bias_add:
+            if bias:
+                return F.linear(x, weight) + bias
+            return F.linear(x, weight)
+        return F.linear(x, weight, bias)
+
+class StackedLinear(torch.nn.Module):
+    """Stacked linear layer.
+
+    Args:
+        num_layers: number of linear layers.
+        input_size: input dimension of the linear layer.
+        output_size: output dimension of the linear layer.
+        bias: If true, add bias.
+        skip_bias_add: If true, skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        linear_method: (Maybe quantized) linear method.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        linear_method: Optional[LinearMethodBase] = None,
+    ):
+        super().__init__()
+
+        # Keep input parameters
+        self.num_layers = num_layers
+        self.input_size = input_size
+        self.output_size = output_size
+        self.skip_bias_add = skip_bias_add
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+        self.params_dtype = params_dtype
+        if linear_method is None:
+            linear_method = StackedUnquantizedLinearMethod()
+        self.linear_method = linear_method
+        self.linear_weights = self.linear_method.create_weights(self.num_layers,
+            self.input_size, self.output_size, self.input_size,
+            self.output_size, self.params_dtype)
+        for name, weight in self.linear_weights.items():
+            if isinstance(weight, torch.Tensor):
+                self.register_parameter(name, weight)
+        if bias:
+            self.bias = Parameter(
+                torch.empty(self.num_layers, self.output_size, dtype=self.params_dtype))
+            set_weight_attrs(self.bias, {"output_dim": 0})
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, index: int, x: torch.Tensor) -> torch.Tensor:
+        if self.skip_bias_add:
+            bias = self.bias[index]
+        else:
+            bias = None
+        output = self.linear_method.apply_weights(index, self.linear_weights, x, bias)
+        output_bias = self.bias[index] if self.skip_bias_add else None
+        if self.skip_bias_add:
+            output_bias = self.bias[index]
+        else:
+            output_bias = None
+        return output, output_bias
     
 class ReplicatedLinear(torch.nn.Module):
     """Replicated linear layer.

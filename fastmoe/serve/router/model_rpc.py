@@ -16,6 +16,7 @@ from fastmoe.serve.io_struct import (
     BatchTokenIDOut,
     FlushCacheReq,
     TokenizedGenerateReqInput,
+    BatchTokenizedGenerateReqInput,
 )
 from fastmoe.serve.router.infer_batch import Batch, ForwardMode, Req
 from fastmoe.serve.router.model_runner import ModelRunner
@@ -89,6 +90,7 @@ class ModelRpcServer(rpyc.Service):
             self.max_total_num_token,
         )
         self.req_to_token_pool = self.model_runner.req_to_token_pool
+        self.req_to_cpu_token_pool = self.model_runner.req_to_cpu_token_pool
         self.token_to_kv_pool = self.model_runner.token_to_kv_pool
 
         # Init running status
@@ -108,6 +110,7 @@ class ModelRpcServer(rpyc.Service):
             self.running_batch is None or len(self.running_batch.reqs) == 0
         ):
             self.req_to_token_pool.clear()
+            self.req_to_cpu_token_pool.clear()
             self.token_to_kv_pool.clear()
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
@@ -127,13 +130,17 @@ class ModelRpcServer(rpyc.Service):
             for recv_req in recv_reqs:
                 if isinstance(recv_req, TokenizedGenerateReqInput):
                     self.handle_generate_request(recv_req)
+                elif isinstance(recv_req, BatchTokenizedGenerateReqInput):
+                    self.handle_batch_generate_request(recv_req)
+                    self.batch_forward_step()
+                    self.flush_cache()
                 elif isinstance(recv_req, FlushCacheReq):
                     self.flush_cache()
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
 
             # Forward
-            self.forward_step()
+            # self.forward_step()
         except Exception:
             logger.error("Exception in ModelRpcClient:\n" + get_exception_traceback())
 
@@ -141,7 +148,166 @@ class ModelRpcServer(rpyc.Service):
         ret = self.out_pyobjs
         self.out_pyobjs = []
         return ret
+    
+    @torch.inference_mode()
+    def batch_forward_step(self):
+        micro_batches = self.generate_micro_batches()
+        
+        # prefill
+        while micro_batches[0].cur_layer < self.model_config.num_hidden_layers:
+            step_num_layers, prefetch_experts, new_micro_batches = self.shuffle_micro_batches(micro_batches)
+            # todo @caoshiyi, do this for each micro batch, use different streams for prefetch, offload and compute
+            self.model_runner.model.prefetch_expert(prefetch_experts)
+            for micro_batch in new_micro_batches:
+                self.forward_partial_fill_batch(micro_batch, step_num_layers)
+                micro_batch.offload_kv_cache()
+                micro_batch.cur_layer += step_num_layers
+                
+        # decode
+        decode_step = 0
+        while True:
+            new_micro_batches = []
+            for micro_batch in micro_batches:
+                if micro_batch.is_empty():
+                    continue
+                # reset states:
+                micro_batch.cur_layer = 0
+                micro_batch.hidden_states = None
+                micro_batch.residual = None
+                new_micro_batches.append(micro_batch)
+            if len(new_micro_batches) == 0:
+                break
+            micro_batches = new_micro_batches
+            print("decode_step:", decode_step)
+            while micro_batches[0].cur_layer < self.model_config.num_hidden_layers:
+                step_num_layers, prefetch_experts, new_micro_batches = self.shuffle_micro_batches(micro_batches)
+                self.model_runner.model.prefetch_expert(prefetch_experts)
+                for micro_batch in new_micro_batches:
+                    micro_batch.load_kv_cache(step_num_layers)
+                    self.forward_partial_decode_batch(micro_batch, step_num_layers)
+                    micro_batch.offload_kv_cache()
+                    micro_batch.cur_layer += step_num_layers
+            decode_step += 1
 
+    def shuffle_micro_batches(self, micro_batches):
+        next_layer = micro_batches[0].cur_layer
+        # todo @caoshiyi, advanced schedule
+        prefetch_experts = [(next_layer + i, j) for j in range(8) for i in range(4)]
+        return 4, prefetch_experts, micro_batches
+
+    # todo @caoshiyi, init_step_num_layers as a parameter
+    def generate_micro_batches(self, init_step_num_layers=4):
+        micro_batches = []
+        cpu_available_size = self.token_to_kv_pool.cpu_available_size()
+        while cpu_available_size > 0:
+            # Add requests if there is available space
+            can_run_list = []
+            new_batch_total_tokens = 0
+            new_batch_input_tokens = 0
+
+            available_size = self.token_to_kv_pool.available_size() // init_step_num_layers
+
+            for req in self.forward_queue:
+                # todo
+                if (
+                    (req.input_len + req.max_new_tokens() + new_batch_total_tokens) * init_step_num_layers
+                    < available_size
+                    and req.input_len + new_batch_input_tokens
+                    < self.max_prefill_num_token
+                ):
+
+                    can_run_list.append(req)
+                    new_batch_total_tokens += (
+                        req.input_len + req.max_new_tokens()
+                    )
+                    new_batch_input_tokens += req.input_len
+
+            if len(can_run_list) == 0:
+                break
+
+            new_batch = Batch.init_new(
+                can_run_list,
+                self.req_to_token_pool,
+                self.token_to_kv_pool,
+                self.req_to_cpu_token_pool,
+            )
+            self.forward_queue = [x for x in self.forward_queue if x not in can_run_list]
+            cpu_available_size -= new_batch_total_tokens
+            micro_batches.append(new_batch)
+        return micro_batches
+    
+    def forward_partial_fill_batch(self, batch: Batch, step_num_layers):
+        if batch.cur_layer == 0:
+            # Build batch tensors
+            batch.prepare_for_partial(
+                self.model_config.vocab_size, self.int_token_logit_bias
+            )
+        
+        batch.prepare_for_partial_memory(step_num_layers)
+
+        if batch.new_num_tokens != 0:
+            if batch.cur_layer + step_num_layers != self.model_config.num_hidden_layers:
+                print("batch.cur_layer:", batch.cur_layer, "step_num_layers:", step_num_layers)
+                # partial forward
+                batch.hidden_states, batch.residual = self.model_runner.forward(
+                    batch, ForwardMode.PARTIAL, batch.return_logprob
+                )
+            else:
+                # last layer forward
+                logits, (logprobs, normalized_logprobs) = self.model_runner.forward(
+                    batch, ForwardMode.PARTIAL, batch.return_logprob
+                )
+                if logprobs is not None:
+                    logprobs = logprobs.cpu().tolist()
+                    normalized_logprobs = normalized_logprobs.cpu().tolist()
+
+                next_token_ids, next_token_probs = batch.sample(logits)
+                next_token_ids = next_token_ids.cpu().tolist()
+        else:
+            next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+            logprobs = normalized_logprobs = None
+
+        if batch.cur_layer + step_num_layers == self.model_config.num_hidden_layers:
+            # Check finish condition
+            reqs = batch.reqs
+            pt = 0
+            for i, req in enumerate(reqs):
+                req.output_ids = [next_token_ids[i]]
+                req.check_finished()
+
+                if logprobs is not None:
+                    req.logprob = logprobs[pt : pt + req.input_len - 1]
+                    req.normalized_logprob = normalized_logprobs[i]
+                    pt += req.input_len
+
+            self.handle_finished_requests(batch)
+
+    def forward_partial_decode_batch(self, batch: Batch, step_num_layers):
+        if batch.cur_layer == 0:
+            # Build batch tensors
+            batch.prepare_for_partial_decode()
+        
+        if batch.cur_layer + step_num_layers != self.model_config.num_hidden_layers:
+            print("batch.cur_layer:", batch.cur_layer, "step_num_layers:", step_num_layers)
+            # partial decode
+            batch.hidden_states, batch.residual = self.model_runner.forward(
+                batch, ForwardMode.PARTIAL_DECODE
+            )
+        else:
+            # last layer forward
+            logits, _ = self.model_runner.forward(batch, ForwardMode.PARTIAL_DECODE)
+            next_token_ids, next_token_probs = batch.sample(logits)
+            next_token_ids = next_token_ids.cpu().tolist()
+
+        if batch.cur_layer + step_num_layers == self.model_config.num_hidden_layers:
+            # Check finish condition
+            reqs = batch.reqs
+            for i in range(len(reqs)):
+                reqs[i].output_ids.append(next_token_ids[i])
+                reqs[i].check_finished()
+
+            self.handle_finished_requests(batch)
+    
     @torch.inference_mode()
     def forward_step(self):
         new_batch = self.get_new_fill_batch()
@@ -207,6 +373,27 @@ class ModelRpcServer(rpyc.Service):
             self.max_total_num_token - 128 - len(req.input_ids),
         )
         self.forward_queue.append(req)
+    
+    def handle_batch_generate_request(
+        self,
+        recv_req: BatchTokenizedGenerateReqInput,
+    ):
+        for i in range(len(recv_req.rid)):
+            req = Req(recv_req.rid[i], recv_req.input_text[i], recv_req.input_ids[i])
+            req.sampling_params = recv_req.sampling_params
+            req.return_logprob = recv_req.return_logprob
+            req.logprob_start_len = recv_req.logprob_start_len
+            req.stream = recv_req.stream
+            req.tokenizer = self.tokenizer
+
+            # Truncate long prompts
+            req.input_ids = req.input_ids[: self.model_config.context_len - 1]
+            req.sampling_params.max_new_tokens = min(
+                req.sampling_params.max_new_tokens,
+                self.model_config.context_len - 1 - len(req.input_ids),
+                self.max_total_num_token - 128 - len(req.input_ids),
+            )
+            self.forward_queue.append(req)
 
     def get_new_fill_batch(self):
         if (

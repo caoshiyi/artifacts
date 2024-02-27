@@ -17,6 +17,7 @@ from fastmoe.serve.io_struct import (
     FlushCacheReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
+    BatchTokenizedGenerateReqInput,
 )
 from fastmoe.serve.sampling_params import SamplingParams
 from fastmoe.serve.server_args import PortArgs, ServerArgs
@@ -113,29 +114,54 @@ class TokenizerManager:
                 event.clear()
         else:
             assert obj.stream is False
-            bs = len(obj.text)
-            for i in range(bs):
-                rid = obj.rid[i]
-                input_ids = self.tokenizer.encode(obj.text[i])
-                sampling_params = SamplingParams(**obj.sampling_params[i])
+            if obj.batch:
+                # in this mode, we assume the batch share the same sampling_params
+                rid = obj.rid
+                input_ids = self.tokenizer(obj.text).input_ids
+                sampling_params = SamplingParams(**obj.sampling_params[0])
                 if sampling_params.max_new_tokens != 0:
-                    sampling_params.normalize(self.tokenizer)
-                    sampling_params.verify()
-                tokenized_obj = TokenizedGenerateReqInput(
+                        sampling_params.normalize(self.tokenizer)
+                        sampling_params.verify()
+                batch_tokenized_obj = BatchTokenizedGenerateReqInput(
                     rid=rid,
-                    input_text=obj.text[i],
+                    input_text=obj.text,
                     input_ids=input_ids,
                     sampling_params=sampling_params,
-                    return_logprob=obj.return_logprob[i],
-                    logprob_start_len=obj.logprob_start_len[i],
+                    return_logprob=obj.return_logprob[0],
+                    logprob_start_len=obj.logprob_start_len[0],
                     stream=obj.stream,
                 )
-                self.send_to_router.send_pyobj(tokenized_obj)
+                self.send_to_router.send_pyobj(batch_tokenized_obj)
+                bs = len(obj.text)
+                for i in range(bs):
+                    lock = asyncio.Lock()
+                    event = asyncio.Event()
+                    state = ReqState([], False, event, lock)
+                    self.rid_to_state[obj.rid[i]] = state
+            else:
+                bs = len(obj.text)
+                for i in range(bs):
+                    rid = obj.rid[i]
+                    input_ids = self.tokenizer.encode(obj.text[i])
+                    sampling_params = SamplingParams(**obj.sampling_params[i])
+                    if sampling_params.max_new_tokens != 0:
+                        sampling_params.normalize(self.tokenizer)
+                        sampling_params.verify()
+                    tokenized_obj = TokenizedGenerateReqInput(
+                        rid=rid,
+                        input_text=obj.text[i],
+                        input_ids=input_ids,
+                        sampling_params=sampling_params,
+                        return_logprob=obj.return_logprob[i],
+                        logprob_start_len=obj.logprob_start_len[i],
+                        stream=obj.stream,
+                    )
+                    self.send_to_router.send_pyobj(tokenized_obj)
 
-                lock = asyncio.Lock()
-                event = asyncio.Event()
-                state = ReqState([], False, event, lock)
-                self.rid_to_state[rid] = state
+                    lock = asyncio.Lock()
+                    event = asyncio.Event()
+                    state = ReqState([], False, event, lock)
+                    self.rid_to_state[rid] = state
 
             output_list = []
             for i in range(bs):

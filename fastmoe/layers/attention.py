@@ -24,6 +24,8 @@ class Attention(nn.Module):
 
         self.prefill_forward = self.prefill_forward_triton
         self.decode_forward = self.decode_forward_triton
+        self.partial_forward = self.partial_forward_triton
+        self.partial_decode_forward = self.partial_decode_forward_triton
 
     def prefill_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         o = torch.empty_like(q)
@@ -38,6 +40,22 @@ class Attention(nn.Module):
             input_metadata.max_seq_len,
         )
         self.store_kv_cache(k, v, input_metadata)
+
+        return o
+    
+    def partial_forward_triton(self, q, k, v, input_metadata: InputMetadata):
+        o = torch.empty_like(q)
+
+        context_attention_fwd(
+            q.view(-1, self.tp_q_head_num, self.head_dim),
+            k,
+            v,
+            o.view(-1, self.tp_q_head_num, self.head_dim),
+            input_metadata.start_loc,
+            input_metadata.seq_lens,
+            input_metadata.max_seq_len,
+        )
+        self.store_kv_cache_partial(k, v, input_metadata)
 
         return o
 
@@ -55,7 +73,27 @@ class Attention(nn.Module):
             input_metadata.start_loc,
             input_metadata.seq_lens,
             input_metadata.max_seq_len,
-            input_metadata.other_kv_index,
+            input_metadata.other_kv_index[:, input_metadata.step_layer, :],
+            input_metadata.total_num_tokens,
+        )
+
+        return o
+    
+    def partial_decode_forward_triton(self, q, k, v, input_metadata: InputMetadata):
+        o = torch.empty_like(q)
+        self.store_kv_cache_partial(k, v, input_metadata)
+
+        token_attention_fwd(
+            q.view(-1, self.tp_q_head_num, self.head_dim),
+            input_metadata.token_to_kv_pool.get_key_buffer(),
+            input_metadata.token_to_kv_pool.get_value_buffer(),
+            o.view(-1, self.tp_q_head_num, self.head_dim),
+            input_metadata.req_to_token_pool.req_to_token[:, input_metadata.step_layer, :],
+            input_metadata.req_pool_indices,
+            input_metadata.start_loc,
+            input_metadata.seq_lens,
+            input_metadata.max_seq_len,
+            input_metadata.other_kv_index[input_metadata.step_layer].item(),
             input_metadata.total_num_tokens,
         )
 
@@ -69,6 +107,10 @@ class Attention(nn.Module):
             return self.prefill_forward(q, k, v, input_metadata)
         elif input_metadata.forward_mode == ForwardMode.DECODE:
             return self.decode_forward(q, k, v, input_metadata)
+        elif input_metadata.forward_mode == ForwardMode.PARTIAL:
+            return self.partial_forward(q, k, v, input_metadata)
+        elif input_metadata.forward_mode == ForwardMode.PARTIAL_DECODE:
+            return self.partial_decode_forward(q, k, v, input_metadata)
 
     def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
         key_buffer = input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id)
@@ -83,5 +125,14 @@ class Attention(nn.Module):
             value_buffer[
                 input_metadata.out_cache_cont_start : input_metadata.out_cache_cont_end
             ] = cache_v
+        else:
+            raise RuntimeError()
+    
+    def store_kv_cache_partial(self, cache_k, cache_v, input_metadata: InputMetadata):
+        key_buffer = input_metadata.token_to_kv_pool.get_key_buffer()
+        value_buffer = input_metadata.token_to_kv_pool.get_value_buffer()
+        if input_metadata.out_cache_loc is not None and input_metadata.step_layer is not None:
+            key_buffer[input_metadata.out_cache_loc[input_metadata.step_layer]] = cache_k
+            value_buffer[input_metadata.out_cache_loc[input_metadata.step_layer]] = cache_v
         else:
             raise RuntimeError()

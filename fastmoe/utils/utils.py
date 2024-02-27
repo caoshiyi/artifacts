@@ -1,3 +1,4 @@
+import psutil
 import random
 import socket
 import sys
@@ -35,6 +36,9 @@ def get_available_gpu_memory(gpu_id, distributed=True):
         free_gpu_memory = tensor.item()
 
     return free_gpu_memory / (1 << 30)
+
+def get_available_cpu_memory():
+    return psutil.virtual_memory().available / (1 << 30)
 
 
 def set_random_seed(seed: int) -> None:

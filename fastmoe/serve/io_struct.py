@@ -19,6 +19,7 @@ class GenerateReqInput:
     logprob_start_len: Optional[Union[List[int], int]] = None
     # Whether to stream output
     stream: bool = False
+    batch: bool = False
 
     def post_init(self):
         is_single = isinstance(self.text, str)
@@ -61,6 +62,16 @@ class TokenizedGenerateReqInput:
     rid: str
     input_text: str
     input_ids: List[int]
+    sampling_params: SamplingParams
+    return_logprob: bool
+    logprob_start_len: int
+    stream: bool
+
+@dataclass
+class BatchTokenizedGenerateReqInput:
+    rid: List[str]
+    input_text: List[str]
+    input_ids: List[List[int]]
     sampling_params: SamplingParams
     return_logprob: bool
     logprob_start_len: int

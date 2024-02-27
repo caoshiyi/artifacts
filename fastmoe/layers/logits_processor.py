@@ -15,7 +15,7 @@ class LogitsProcessor(nn.Module):
 
     def forward(self, input_ids, hidden_states, weight, input_metadata):
         if not input_metadata.return_logprob:
-            if input_metadata.forward_mode == ForwardMode.DECODE:
+            if input_metadata.forward_mode == ForwardMode.DECODE or input_metadata.forward_mode == ForwardMode.PARTIAL_DECODE:
                 last_hidden = hidden_states
             else:
                 last_index = (

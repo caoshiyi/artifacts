@@ -10,6 +10,8 @@ from fastmoe.backend.memory import ReqToTokenPool, TokenToKVPool
 class ForwardMode(Enum):
     PREFILL = auto()
     DECODE = auto()
+    PARTIAL = auto()
+    PARTIAL_DECODE = auto()
 
 
 class FinishReason(Enum):
@@ -79,7 +81,18 @@ class Req:
 class Batch:
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool
+    req_to_cpu_token_pool: ReqToTokenPool
     token_to_kv_pool: TokenToKVPool
+
+    # progress states, memory states
+    cur_layer: int = 0
+    cpu_indices: torch.Tensor = None
+    all_cpu_indices: torch.Tensor = None
+    gpu_indices: torch.Tensor = None
+    req_cpu_pool_indices: torch.Tensor = None
+    # intermediate results
+    hidden_states: torch.Tensor = None
+    residual: torch.Tensor = None
 
     # batched arguments to model runner
     input_ids: torch.Tensor = None
@@ -104,18 +117,152 @@ class Batch:
     logit_bias: torch.Tensor = None
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool):
+    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, req_to_cpu_token_pool=None):
+        assert req_to_cpu_token_pool is not None
         return_logprob = any(req.return_logprob for req in reqs)
 
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
+            req_to_cpu_token_pool=req_to_cpu_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             return_logprob=return_logprob,
         )
 
     def is_empty(self):
         return len(self.reqs) == 0
+    
+    def offload_kv_cache(self):
+        # prefill first layer
+        if self.cpu_indices is None:
+            self.cpu_indices = self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc)
+            self.req_to_token_pool.free(self.req_pool_indices)
+            self.req_pool_indices = None
+            self.out_cache_loc = None
+            self.req_cpu_pool_indices = self.req_to_cpu_token_pool.alloc(len(self.reqs))
+            req_cpu_pool_indices_cpu = self.req_cpu_pool_indices.cpu().numpy()
+            pt = 0
+            for i in range(len(self.reqs)):
+                seq_len = self.seq_lens[i].item()
+                self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][: seq_len] = self.cpu_indices[pt : pt + seq_len]
+                pt += seq_len
+            self.all_cpu_indices = self.cpu_indices
+        # decode first layer
+        elif self.cur_layer == 0:
+            self.cpu_indices = self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc)
+            self.req_to_token_pool.free(self.req_pool_indices)
+            self.req_pool_indices = None
+            self.out_cache_loc = None
+            req_cpu_pool_indices_cpu = self.req_cpu_pool_indices.cpu().numpy()
+            all_cpu_indicies = []
+            for i in range(len(self.reqs)):
+                seq_len = self.seq_lens[i].item()
+                self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][seq_len] = self.cpu_indices[i]
+                all_cpu_indicies.append(self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][:seq_len+1])
+            self.all_cpu_indices = torch.cat(all_cpu_indicies, dim=0)
+        else:
+            self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc, self.cpu_indices, self.cur_layer)
+            self.out_cache_loc = None
+
+    def load_kv_cache(self, step_num_layers):
+        assert self.all_cpu_indices is not None, "all_cpu_indices should not be None"
+        bs = len(self.reqs)
+        layer_ids = torch.arange(self.cur_layer, self.cur_layer + step_num_layers)
+        if self.req_pool_indices is None:
+            self.req_pool_indices = self.req_to_token_pool.alloc(bs)
+            assert self.req_pool_indices is not None
+        req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
+        assert self.token_to_kv_pool.available_size() >= len(self.all_cpu_indices) * len(layer_ids) + bs * step_num_layers
+        gpu_indices = self.token_to_kv_pool.load_kv_cache(self.all_cpu_indices, layer_ids)
+        self.out_cache_loc = self.token_to_kv_pool.alloc(bs*step_num_layers).reshape(step_num_layers, -1)
+        pt = 0
+        for i in range(bs):
+            seq_len = self.seq_lens[i].item()
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][:step_num_layers, :seq_len] = gpu_indices[:, pt : pt + seq_len]
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][:step_num_layers, seq_len] = self.out_cache_loc[:, i]
+            pt += seq_len
+    
+    def prepare_for_partial_decode(self):
+        # prepare for decode
+        input_ids = [
+            r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
+        ]
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+        self.seq_lens.add_(1)
+        self.out_cache_cont_start = None
+        self.out_cache_cont_end = None
+
+    
+    def prepare_for_partial_memory(self, step_num_layers):
+        bs = len(self.reqs)
+        req_pool_indices = self.req_to_token_pool.alloc(bs)
+        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+        self.out_cache_loc = self.token_to_kv_pool.alloc(self.new_num_tokens*step_num_layers).reshape(step_num_layers, -1)
+
+        pt = 0
+        for i in range(bs):
+            seq_len = len(self.reqs[i].input_ids)
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][:step_num_layers, :seq_len] = self.out_cache_loc[:, pt : pt + seq_len]
+            pt += seq_len
+        
+        self.req_pool_indices = req_pool_indices
+    
+    def prepare_for_partial(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
+        device = "cuda"
+        bs = len(self.reqs)
+        reqs = self.reqs
+        input_ids = [r.input_ids for r in reqs]
+    
+        flatten_input_ids = []
+        seq_lens = []
+
+        for i in range(bs):
+            flatten_input_ids.extend(input_ids[i])
+            seq_lens.append(len(input_ids[i]))
+
+        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+        # Alloc mem
+        seq_lens = np.array(seq_lens)
+        new_num_tokens = seq_lens.sum()
+        print("new_num_tokens", new_num_tokens)
+
+        # Handle logit bias
+        logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
+        for i in range(bs):
+            if reqs[i].sampling_params.dtype == "int":
+                logit_bias[i] = int_token_logit_bias
+
+        # Set fields
+        self.input_ids = torch.tensor(
+            flatten_input_ids, dtype=torch.int32, device=device
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        self.position_ids_offsets = position_ids_offsets
+        self.new_num_tokens = new_num_tokens
+
+        self.temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            device=device,
+        ).view(-1, 1)
+        self.top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+        ).view(-1, 1)
+        self.top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
+        ).view(-1, 1)
+        self.frequency_penalties = torch.tensor(
+            [r.sampling_params.frequency_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+        self.presence_penalties = torch.tensor(
+            [r.sampling_params.presence_penalty for r in reqs],
+            dtype=torch.float,
+            device=device,
+        )
+        self.logit_bias = logit_bias
 
     def prepare_for_extend(self, vocab_size: int, int_token_logit_bias: torch.Tensor):
         device = "cuda"
