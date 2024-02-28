@@ -91,7 +91,7 @@ def fused_moe_kernel(
     # B
     b_ind = tl.load(b_ind_ptr + off_experts)
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    b_ptrs = b_ptr + b_ind * stride_be + w2_off * stride_bk + (offs_k[:, None] * stride_bk +
+    b_ptrs = b_ptr + b_ind * stride_be + w2_off * stride_bn + (offs_k[:, None] * stride_bk +
                                                 offs_bn[None, :] * stride_bn)
 
     # -----------------------------------------------------------
@@ -315,10 +315,10 @@ def stack_fused_moe(
 
     ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
 
-    invoke_fused_moe_kernel(intermediate_cache2, w1.view(w1.shape[0], H, -1), indicies, intermediate_cache3,
+    invoke_fused_moe_kernel(intermediate_cache2, w1.view(w1.shape[0], -1, N//2), indicies, intermediate_cache3,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, True, 1,
-                            config, H, N // 2, N) 
+                            config, H, N // 2, 2*H)
 
     if inplace:
         return torch.sum(intermediate_cache3.view(*intermediate_cache3.shape),

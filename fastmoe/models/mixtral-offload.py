@@ -284,10 +284,12 @@ class MixtralModel(nn.Module):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.org_vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            org_num_embeddings=config.vocab_size,
         )
         self.tp_size = get_tensor_model_parallel_world_size()
         self.memory_pool = memory_pool
@@ -300,8 +302,8 @@ class MixtralModel(nn.Module):
             intermediate_size=config.intermediate_size,
             memory_pool=self.memory_pool)
         self.layers = nn.ModuleList([
-            MixtralDecoderLayer(config, block_sparse_moe=self.block_sparse_moe, linear_method=linear_method)
-            for _ in range(config.num_hidden_layers)
+            MixtralDecoderLayer(config, i, block_sparse_moe=self.block_sparse_moe, linear_method=linear_method)
+            for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -378,7 +380,7 @@ class MixtralForCausalLMOff(nn.Module):
             index = indices[i]
             self.model.block_sparse_moe.ws.mapping[layer_id, expert_id] = index
             # copy from cpu to gpu
-            self.expert_pool.mem_data[index].copy_(self.model.block_sparse_moe.ws[layer_id, expert_id])
+            self.expert_pool.mem_data[index].copy_(self.model.block_sparse_moe.ws.data[layer_id, expert_id])
             # add layer_id to cur_layers
         self.current_experts = experts
         self.cur_layers = []
@@ -410,7 +412,7 @@ class MixtralForCausalLMOff(nn.Module):
         expert_params_mapping = [
             # (param_name, weight_name, expert_id)
             ("block_sparse_moe.ws",
-             f"layers.{layer_id}.block_sparse_moe.experts.{expert_id}.{weight_name}.weight", expert_id)
+             f"layers.{layer_id}.block_sparse_moe.experts.{expert_id}.{weight_name}.weight", expert_id, layer_id)
             for expert_id in range(self.config.num_local_experts)
             for weight_name in ["w1", "w2", "w3"]
             for layer_id in range(self.config.num_hidden_layers)
@@ -454,7 +456,7 @@ class MixtralForCausalLMOff(nn.Module):
                     weight_loader(param, loaded_weight, shard_id)
                     break
                 else:
-                    for param_name, weight_name, expert_id in expert_params_mapping:
+                    for param_name, weight_name, expert_id, layer_id in expert_params_mapping:
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
