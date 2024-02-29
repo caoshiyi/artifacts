@@ -119,21 +119,27 @@ class TokenToKVPool:
         ]
 
     # gpu_indices: [num_layer, num_token], cpu_indices: [num_token]
-    def offload_kv_cache(self, gpu_indices, cpu_indices=None, start_layer=0):
+    def offload_kv_cache(self, gpu_indices, cpu_indices=None, other_gpu_indices=None, start_layer=0):
+        if other_gpu_indices is not None:
+            self.decrease_refs(other_gpu_indices.flatten())
         if cpu_indices is None:
             need_size = gpu_indices.shape[1] # num_token
             select_index = torch.nonzero(self.cpu_mem_state == 0).squeeze(1)[:need_size]
             assert select_index.shape[0] >= need_size
             self.cpu_mem_state[select_index] += 1
-            self.gpu_mem_state[gpu_indices.flatten()] -= 1
             self.alloc_ct_cpu += need_size
+            self.decrease_refs(gpu_indices.flatten())
+            # todo @caoshiyi optimize, use kernels
             for layer in range(gpu_indices.shape[0]):
-                self.kv_data_cpu[layer][select_index].copy_(self.kv_data[gpu_indices[layer, :]])
+                for i, index in enumerate(select_index):
+                    self.kv_data_cpu[layer][index, :].copy_(self.kv_data[gpu_indices[layer, i], :])
             return select_index
         else:
-            self.gpu_mem_state[gpu_indices.flatten()] -= 1
+            self.decrease_refs(gpu_indices.flatten())
+            # todo @caoshiyi optimize, use kernels
             for layer in range(gpu_indices.shape[0]):
-                self.kv_data_cpu[start_layer+layer][cpu_indices].copy_(self.kv_data[gpu_indices[layer, :]])
+                for i, index in enumerate(cpu_indices):
+                    self.kv_data_cpu[start_layer+layer][index, :].copy_(self.kv_data[gpu_indices[layer, i], :])
             return cpu_indices
 
 
@@ -142,10 +148,10 @@ class TokenToKVPool:
         select_index = torch.nonzero(self.gpu_mem_state == 0).squeeze(1)[:need_size]
         assert select_index.shape[0] >= need_size
         select_index = select_index.view(len(layer_ids), len(cpu_indices))
-        self.gpu_mem_state[select_index] += 1
+        # todo @caoshiyi optimize, use kernels
         for i, layer in enumerate(layer_ids):
-            self.kv_data[select_index[i, :]].copy_(self.kv_data_cpu[layer][cpu_indices])
-        
+            for j, index in enumerate(cpu_indices):
+                self.kv_data[select_index[i, j], :].copy_(self.kv_data_cpu[layer][index, :])
         self.add_refs(select_index)
         return select_index.to(torch.int32)
 

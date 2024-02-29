@@ -87,6 +87,7 @@ class Batch:
     # progress states, memory states
     cur_layer: int = 0
     cpu_indices: torch.Tensor = None
+    prev_cpu_indices: torch.Tensor = None
     all_cpu_indices: torch.Tensor = None
     gpu_indices: torch.Tensor = None
     req_cpu_pool_indices: torch.Tensor = None
@@ -149,7 +150,7 @@ class Batch:
             self.all_cpu_indices = self.cpu_indices
         # decode first layer
         elif self.cur_layer == 0:
-            self.cpu_indices = self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc)
+            self.cpu_indices = self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc, other_gpu_indices=self.gpu_indices)
             self.req_to_token_pool.free(self.req_pool_indices)
             self.req_pool_indices = None
             self.out_cache_loc = None
@@ -157,28 +158,32 @@ class Batch:
             all_cpu_indicies = []
             for i in range(len(self.reqs)):
                 seq_len = self.seq_lens[i].item()
-                self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][seq_len] = self.cpu_indices[i]
-                all_cpu_indicies.append(self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][:seq_len+1])
+                self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][seq_len-1] = self.cpu_indices[i]
+                all_cpu_indicies.append(self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][:seq_len])
             self.all_cpu_indices = torch.cat(all_cpu_indicies, dim=0)
         else:
-            self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc, self.cpu_indices, self.cur_layer)
+            self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc, self.cpu_indices, self.gpu_indices, self.cur_layer)
+            self.req_to_token_pool.free(self.req_pool_indices)
+            self.req_pool_indices = None
             self.out_cache_loc = None
 
     def load_kv_cache(self, step_num_layers):
-        assert self.all_cpu_indices is not None, "all_cpu_indices should not be None"
+        if self.cur_layer == 0:
+            self.prev_cpu_indices = self.all_cpu_indices
+        assert self.prev_cpu_indices is not None, "prev_cpu_indices should not be None"
         bs = len(self.reqs)
         layer_ids = torch.arange(self.cur_layer, self.cur_layer + step_num_layers)
         if self.req_pool_indices is None:
             self.req_pool_indices = self.req_to_token_pool.alloc(bs)
             assert self.req_pool_indices is not None
         req_pool_indices_cpu = self.req_pool_indices.cpu().numpy()
-        assert self.token_to_kv_pool.available_size() >= len(self.all_cpu_indices) * len(layer_ids) + bs * step_num_layers
-        gpu_indices = self.token_to_kv_pool.load_kv_cache(self.all_cpu_indices, layer_ids)
+        assert self.token_to_kv_pool.available_size() >= len(self.prev_cpu_indices) * len(layer_ids) + bs * step_num_layers
+        self.gpu_indices = self.token_to_kv_pool.load_kv_cache(self.prev_cpu_indices, layer_ids)
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs*step_num_layers).reshape(step_num_layers, -1)
         pt = 0
         for i in range(bs):
-            seq_len = self.seq_lens[i].item()
-            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][:step_num_layers, :seq_len] = gpu_indices[:, pt : pt + seq_len]
+            seq_len = self.seq_lens[i].item() - 1
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][:step_num_layers, :seq_len] = self.gpu_indices[:, pt : pt + seq_len]
             self.req_to_token_pool.req_to_token[req_pool_indices_cpu[i]][:step_num_layers, seq_len] = self.out_cache_loc[:, i]
             pt += seq_len
     
@@ -396,6 +401,7 @@ class Batch:
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
 
+    # todo @caoshiyi
     def filter_batch(self, unfinished_indices: List[int]):
         self.reqs = [self.reqs[i] for i in unfinished_indices]
         new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")

@@ -183,6 +183,9 @@ class ModelRpcServer(rpyc.Service):
                 step_num_layers, prefetch_experts, new_micro_batches = self.shuffle_micro_batches(micro_batches)
                 self.model_runner.model.prefetch_expert(prefetch_experts)
                 for micro_batch in new_micro_batches:
+                    if micro_batch.cur_layer == 0:
+                        # Build batch tensors
+                        micro_batch.prepare_for_partial_decode()
                     micro_batch.load_kv_cache(step_num_layers)
                     self.forward_partial_decode_batch(micro_batch, step_num_layers)
                     micro_batch.offload_kv_cache()
@@ -283,9 +286,6 @@ class ModelRpcServer(rpyc.Service):
             self.handle_finished_requests(batch)
 
     def forward_partial_decode_batch(self, batch: Batch, step_num_layers):
-        if batch.cur_layer == 0:
-            # Build batch tensors
-            batch.prepare_for_partial_decode()
         
         if batch.cur_layer + step_num_layers != self.model_config.num_hidden_layers:
             print("batch.cur_layer:", batch.cur_layer, "step_num_layers:", step_num_layers)
