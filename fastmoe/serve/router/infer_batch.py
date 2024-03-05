@@ -162,6 +162,7 @@ class Batch:
                 all_cpu_indicies.append(self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices_cpu[i]][:seq_len])
             self.all_cpu_indices = torch.cat(all_cpu_indicies, dim=0)
         else:
+            assert self.out_cache_loc is not None
             self.token_to_kv_pool.offload_kv_cache(self.out_cache_loc, self.cpu_indices, self.gpu_indices, self.cur_layer)
             self.req_to_token_pool.free(self.req_pool_indices)
             self.req_pool_indices = None
@@ -180,6 +181,7 @@ class Batch:
         assert self.token_to_kv_pool.available_size() >= len(self.prev_cpu_indices) * len(layer_ids) + bs * step_num_layers
         self.gpu_indices = self.token_to_kv_pool.load_kv_cache(self.prev_cpu_indices, layer_ids)
         self.out_cache_loc = self.token_to_kv_pool.alloc(bs*step_num_layers).reshape(step_num_layers, -1)
+        assert self.out_cache_loc is not None
         pt = 0
         for i in range(bs):
             seq_len = self.seq_lens[i].item() - 1
@@ -201,6 +203,7 @@ class Batch:
     def prepare_for_partial_memory(self, step_num_layers):
         bs = len(self.reqs)
         req_pool_indices = self.req_to_token_pool.alloc(bs)
+        assert req_pool_indices is not None
         req_pool_indices_cpu = req_pool_indices.cpu().numpy()
         self.out_cache_loc = self.token_to_kv_pool.alloc(self.new_num_tokens*step_num_layers).reshape(step_num_layers, -1)
 
@@ -402,14 +405,27 @@ class Batch:
         ] = self.out_cache_loc
 
     # todo @caoshiyi
-    def filter_batch(self, unfinished_indices: List[int]):
+    def filter_batch(self, unfinished_indices: List[int], forward_mode: ForwardMode):
+        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cpu")
+        seq_lens_list = self.seq_lens.cpu().numpy().tolist()
+        if forward_mode == ForwardMode.PARTIAL_DECODE:
+            self.out_cache_loc = self.out_cache_loc[:, new_indices]
+            self.cpu_indices = self.cpu_indices[new_indices]
+            split_all_cpu_indices = torch.split(self.all_cpu_indices, seq_lens_list)
+            self.all_cpu_indices = torch.cat([split_all_cpu_indices[i] for i in unfinished_indices])
+        elif forward_mode == ForwardMode.PARTIAL:
+            split_out_cache_loc = torch.split(self.out_cache_loc, seq_lens_list, dim=1)
+            self.out_cache_loc = torch.cat([split_out_cache_loc[i] for i in unfinished_indices], dim=1)
+            split_cpu_indices = torch.split(self.cpu_indices, seq_lens_list)
+            self.cpu_indices = torch.cat([split_cpu_indices[i] for i in unfinished_indices])
+            self.all_cpu_indices = self.cpu_indices
+            
         self.reqs = [self.reqs[i] for i in unfinished_indices]
-        new_indices = torch.tensor(unfinished_indices, dtype=torch.int32, device="cuda")
         self.seq_lens = self.seq_lens[new_indices]
         self.input_ids = None
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.position_ids_offsets = self.position_ids_offsets[new_indices]
-        self.out_cache_loc = self.out_cache_cont_start = self.out_cache_cont_end = None
+        self.out_cache_cont_start = self.out_cache_cont_end = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         for item in [

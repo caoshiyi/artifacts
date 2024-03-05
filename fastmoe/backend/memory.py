@@ -153,6 +153,7 @@ class TokenToKVPool:
             for j, index in enumerate(cpu_indices):
                 self.kv_data[select_index[i, j], :].copy_(self.kv_data_cpu[layer][index, :])
         self.add_refs(select_index)
+        print("KV available size: ", self.available_size())
         return select_index.to(torch.int32)
 
     def get_key_buffer(self):

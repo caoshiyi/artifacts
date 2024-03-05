@@ -250,7 +250,7 @@ class ModelRunner:
         self.req_to_cpu_token_pool = None
         # todo *10? 
         self.req_to_token_pool = ReqToTokenPool(
-            int(self.max_total_num_token / max_step_num_layers / self.model_config.context_len * 10),
+            int(self.max_total_num_token / max_step_num_layers / self.model_config.context_len * 256),
             self.model_config.context_len + 8,
             max_step_num_layers,
         )

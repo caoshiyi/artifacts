@@ -152,6 +152,7 @@ class ModelRpcServer(rpyc.Service):
     @torch.inference_mode()
     def batch_forward_step(self):
         micro_batches = self.generate_micro_batches()
+        print("Num Micro Batches:", len(micro_batches))
         
         # prefill
         while micro_batches[0].cur_layer < self.model_config.num_hidden_layers:
@@ -208,7 +209,7 @@ class ModelRpcServer(rpyc.Service):
             new_batch_total_tokens = 0
             new_batch_input_tokens = 0
 
-            available_size = self.token_to_kv_pool.available_size() // init_step_num_layers
+            available_size = self.token_to_kv_pool.available_size()
 
             for req in self.forward_queue:
                 # todo
@@ -216,7 +217,7 @@ class ModelRpcServer(rpyc.Service):
                     (req.input_len + req.max_new_tokens() + new_batch_total_tokens) * init_step_num_layers
                     < available_size
                     and req.input_len + new_batch_input_tokens
-                    < self.max_prefill_num_token
+                    < self.max_prefill_num_token and len(can_run_list) < 256
                 ):
 
                     can_run_list.append(req)
@@ -237,6 +238,7 @@ class ModelRpcServer(rpyc.Service):
             self.forward_queue = [x for x in self.forward_queue if x not in can_run_list]
             cpu_available_size -= new_batch_total_tokens
             micro_batches.append(new_batch)
+            print("Append new micro batch. #reqs:", len(new_batch.reqs), "new_batch_input_tokens:", new_batch_input_tokens)
         return micro_batches
     
     def forward_partial_fill_batch(self, batch: Batch, step_num_layers):
@@ -283,7 +285,7 @@ class ModelRpcServer(rpyc.Service):
                     req.normalized_logprob = normalized_logprobs[i]
                     pt += req.input_len
 
-            self.handle_finished_requests(batch)
+            self.handle_finished_requests(batch, ForwardMode.PARTIAL)
 
     def forward_partial_decode_batch(self, batch: Batch, step_num_layers):
         
@@ -306,7 +308,7 @@ class ModelRpcServer(rpyc.Service):
                 reqs[i].output_ids.append(next_token_ids[i])
                 reqs[i].check_finished()
 
-            self.handle_finished_requests(batch)
+            self.handle_finished_requests(batch, ForwardMode.PARTIAL_DECODE)
     
     @torch.inference_mode()
     def forward_step(self):
@@ -526,7 +528,7 @@ class ModelRpcServer(rpyc.Service):
 
         self.handle_finished_requests(batch)
 
-    def handle_finished_requests(self, batch: Batch):
+    def handle_finished_requests(self, batch: Batch, forward_mode: ForwardMode = None):
         output_rids = []
         output_tokens = []
         output_hit_stop_str = []
@@ -582,19 +584,22 @@ class ModelRpcServer(rpyc.Service):
         # Remove finished reqs
         if finished_indices:
             req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+            req_cpu_pool_indices_cpu = batch.req_cpu_pool_indices.cpu().tolist()
             for i in finished_indices:
                 req = batch.reqs[i]
                 req_pool_idx = req_pool_indices_cpu[i]
+                req_cpu_pool_idx = req_cpu_pool_indices_cpu[i]
                 token_ids = tuple(req.input_ids + req.output_ids)
                 seq_len = len(token_ids) - 1
-                indices = self.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
+                indices = self.req_to_token_pool.req_to_token[req_pool_idx, :, :seq_len]
 
-                self.token_to_kv_pool.free(indices)
+                self.token_to_kv_pool.free(indices.flatten())
                 self.req_to_token_pool.free(req_pool_idx)
+                self.req_to_cpu_token_pool.free(req_cpu_pool_idx)
 
             # Update batch tensors
             if unfinished_indices:
-                batch.filter_batch(unfinished_indices)
+                batch.filter_batch(unfinished_indices, forward_mode)
             else:
                 batch.reqs = []
 
