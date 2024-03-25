@@ -21,22 +21,32 @@ if __name__ == "__main__":
     
     questions = load_questions("./question.jsonl")
     prompts = []
-    for i in range(100):
+    for i in range(12):
         for question in questions:
                 prompts.append(question["turns"][0])
 
 
-
+    warmup = requests.post(
+        url + "/generate",
+        json={
+            "text": prompts[:50],
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 1,
+            },
+            "batch": True,
+        },
+    )
 
 
     start = time.time()
     response = requests.post(
         url + "/generate",
         json={
-            "text": prompts,
+            "text": prompts[:960],
             "sampling_params": {
                 "temperature": 0,
-                "max_new_tokens": 30,
+                "max_new_tokens": 1,
             },
             "batch": True,
         },

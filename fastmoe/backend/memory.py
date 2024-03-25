@@ -66,12 +66,13 @@ class MemoryPool:
 
 
 class ReqToTokenPool:
-    def __init__(self, size, max_context_len, num_layers, device="cuda"):
+    def __init__(self, size, max_context_len, device="cuda"):
+        self.size = size
         self.mem_state = torch.ones((size,), dtype=torch.bool, device="cuda")
         self.can_use_mem_size = size
         if device == "cuda":
             self.req_to_token = torch.empty(
-                (size, num_layers, max_context_len), dtype=torch.int32, device="cuda"
+                (size, max_context_len), dtype=torch.int32, device="cuda"
             )
         else:
             self.req_to_token = torch.empty(
@@ -79,6 +80,7 @@ class ReqToTokenPool:
             )
 
     def alloc(self, need_size):
+        print("need_size: ", need_size, "can_use_mem_size: ", self.can_use_mem_size)
         if need_size > self.can_use_mem_size:
             return None
 
@@ -117,6 +119,12 @@ class TokenToKVPool:
             torch.empty((cpu_size, 2, head_num, head_dim), dtype=dtype, device="cpu")
             for _ in range(layer_num)
         ]
+    
+    def offload(self, dst_start, dst_end, src_start, src_end, layer):
+        self.kv_data_cpu[layer][dst_start:dst_end, :].copy_(self.kv_data[src_start:src_end, :], non_blocking=True)
+    
+    def load(self, dst_start, dst_end, src_start, src_end, layer):
+        self.kv_data[dst_start:dst_end, :].copy_(self.kv_data_cpu[layer][src_start:src_end, :], non_blocking=True)
 
     # gpu_indices: [num_layer, num_token], cpu_indices: [num_token]
     def offload_kv_cache(self, gpu_indices, cpu_indices=None, other_gpu_indices=None, start_layer=0):
@@ -131,15 +139,16 @@ class TokenToKVPool:
             self.decrease_refs(gpu_indices.flatten())
             # todo @caoshiyi optimize, use kernels
             for layer in range(gpu_indices.shape[0]):
-                for i, index in enumerate(select_index):
-                    self.kv_data_cpu[layer][index, :].copy_(self.kv_data[gpu_indices[layer, i], :])
+            #     for i, index in enumerate(select_index):
+            #         self.kv_data_cpu[layer][index, :].copy_(self.kv_data[gpu_indices[layer, i], :], non_blocking=True)
+                self.kv_data_cpu[layer][select_index[0]:select_index[0]+len(select_index), :].copy_(self.kv_data[gpu_indices[layer, :], :], non_blocking=True)
             return select_index
         else:
             self.decrease_refs(gpu_indices.flatten())
             # todo @caoshiyi optimize, use kernels
             for layer in range(gpu_indices.shape[0]):
-                for i, index in enumerate(cpu_indices):
-                    self.kv_data_cpu[start_layer+layer][index, :].copy_(self.kv_data[gpu_indices[layer, i], :])
+                # for i, index in enumerate(cpu_indices):
+                self.kv_data_cpu[start_layer+layer][cpu_indices[0]:cpu_indices[0]+len(cpu_indices), :].copy_(self.kv_data[gpu_indices[layer, :], :], non_blocking=True)
             return cpu_indices
 
 
@@ -150,8 +159,8 @@ class TokenToKVPool:
         select_index = select_index.view(len(layer_ids), len(cpu_indices))
         # todo @caoshiyi optimize, use kernels
         for i, layer in enumerate(layer_ids):
-            for j, index in enumerate(cpu_indices):
-                self.kv_data[select_index[i, j], :].copy_(self.kv_data_cpu[layer][index, :])
+            # for j, index in enumerate(cpu_indices):
+            self.kv_data[select_index[i, 0]:select_index[i, 0]+len(cpu_indices), :].copy_(self.kv_data_cpu[layer][cpu_indices[:], :])
         self.add_refs(select_index)
         print("KV available size: ", self.available_size())
         return select_index.to(torch.int32)
@@ -168,6 +177,15 @@ class TokenToKVPool:
             return None
 
         self.add_refs(select_index)
+        return select_index.to(torch.int32)
+    
+    def alloc_cpu(self, need_size):
+        select_index = torch.nonzero(self.cpu_mem_state == 0).squeeze(1)[:need_size]
+        if select_index.shape[0] < need_size:
+            return None
+
+        self.cpu_mem_state[select_index] += 1
+        self.alloc_ct_cpu += need_size
         return select_index.to(torch.int32)
 
     # todo, alloc_multi_contiguous

@@ -294,6 +294,9 @@ def stack_fused_moe(
             'BLOCK_SIZE_K': 64,
             'GROUP_SIZE_M': 1
         }
+    
+    if M == 400:
+        print(topk_ids)
 
     intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N),
                                       device=hidden_states.device,

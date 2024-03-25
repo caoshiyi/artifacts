@@ -22,11 +22,11 @@
 # limitations under the License.
 """Inference-only Mixtral model."""
 from typing import List, Optional, Tuple
-
 import torch
 from torch import nn
 from transformers import MixtralConfig
 from tqdm import tqdm
+import time
 
 from fastmoe.layers.attention import Attention
 from fastmoe.layers.stacked_fused_moe import stack_fused_moe
@@ -265,6 +265,7 @@ class MixtralDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             input_metadata=input_metadata,
         )
+        # print(f"Layer {self.layer_id} hidden_states: {hidden_states[:10,:10]}")
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
@@ -323,10 +324,14 @@ class MixtralModel(nn.Module):
             cur_layers = range(len(self.layers))
         for i in cur_layers:
             layer = self.layers[i]
-            input_metadata.step_layer = i - cur_layers[0]
+            # input_metadata.step_layer = i
+            # torch.cuda.synchronize()
+            # start = time.time()
             hidden_states, residual = layer(positions, hidden_states,
                                             input_metadata,
                                             residual)
+            # torch.cuda.synchronize()
+            # print(f"Layer {i} time: {time.time() - start}")
         if cur_layers[-1] != len(self.layers) - 1:
             return hidden_states, residual
         else:
@@ -349,8 +354,7 @@ class MixtralForCausalLMOff(nn.Module):
         self.model = MixtralModel(config, linear_method, memory_pool)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.current_experts = []
-        self.cur_layers = []
+        # self.current_experts = []
 
     def forward(
         self,
@@ -359,10 +363,11 @@ class MixtralForCausalLMOff(nn.Module):
         input_metadata: InputMetadata,
         hidden_states: torch.Tensor = None,
         residual: torch.Tensor = None,
+        cur_layers: List[int] = None,
     ) -> torch.Tensor:
         hidden_states, residual = self.model(input_ids, positions,
-                                   input_metadata, hidden_states=hidden_states, residual=residual, cur_layers=self.cur_layers)
-        if self.config.num_hidden_layers - 1 not in self.cur_layers:
+                                   input_metadata, hidden_states=hidden_states, residual=residual, cur_layers=cur_layers)
+        if self.config.num_hidden_layers - 1 not in cur_layers:
             return hidden_states, residual
         else:
             return self.logits_processor(
@@ -370,23 +375,24 @@ class MixtralForCausalLMOff(nn.Module):
             )
     
     def prefetch_expert(self, experts: List[Tuple[int, int]]):
-        if experts == self.current_experts:
-            return
-        self.evict_expert(self.current_experts)
-        need_size = len(experts)
-        indices = self.expert_pool.alloc(need_size)
-        assert indices is not None, "Not enough memory for prefetch."
-        for i, (layer_id, expert_id) in enumerate(experts):
-            index = indices[i]
-            self.model.block_sparse_moe.ws.mapping[layer_id, expert_id] = index
-            # copy from cpu to gpu
-            self.expert_pool.mem_data[index].copy_(self.model.block_sparse_moe.ws.data[layer_id, expert_id])
-            # add layer_id to cur_layers
-        self.current_experts = experts
-        self.cur_layers = []
-        for layer_id, _ in self.current_experts:
-            if layer_id not in self.cur_layers:
-                self.cur_layers.append(layer_id)
+        # if all(element in self.current_experts for element in experts):
+        #     return
+        # need_size = len(experts)
+        # indices = self.expert_pool.alloc(need_size)
+        # if indices is None:
+        #     self.evict_expert(self.current_experts[: len(experts)])
+        #     indices = self.expert_pool.alloc(need_size)
+        #     self.current_experts = self.current_experts[len(experts):]
+        # assert indices is not None, "Not enough memory for prefetch."
+        start_pos = (experts[0][0] * self.config.num_local_experts + experts[0][1]) % self.expert_pool.size
+        end_pos = start_pos + len(experts)
+        self.expert_pool.mem_data[start_pos:end_pos].copy_(self.model.block_sparse_moe.ws.data[experts[0][0], :], non_blocking=True)
+        # for i, (layer_id, expert_id) in enumerate(experts):
+        #     index = indices[i]
+        #     self.model.block_sparse_moe.ws.mapping[layer_id, expert_id] = index
+        # if len(self.current_experts) + len(experts) > self.expert_pool.size:
+        #     self.current_experts = self.current_experts[len(experts):]
+        # self.current_experts.extend(experts)
 
     def evict_expert(self, experts: List[Tuple[int, int]]):
         if not experts:
@@ -476,5 +482,11 @@ class MixtralForCausalLMOff(nn.Module):
                         weight_loader = getattr(param, "weight_loader",
                                                 default_weight_loader)
                         weight_loader(param, loaded_weight)
+        
+        # self.model.block_sparse_moe.ws.data = self.model.block_sparse_moe.ws.data.pin_memory()
+        # init mapping
+        for layer_id in range(32):  # Iterate over 32 layers
+            for expert_id in range(8):
+                self.model.block_sparse_moe.ws.mapping[layer_id, expert_id] = (layer_id * self.config.num_local_experts + expert_id) % self.expert_pool.size
 
 EntryClass = MixtralForCausalLMOff

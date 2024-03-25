@@ -73,7 +73,7 @@ class Attention(nn.Module):
             input_metadata.start_loc,
             input_metadata.seq_lens,
             input_metadata.max_seq_len,
-            input_metadata.other_kv_index[:, input_metadata.step_layer, :],
+            input_metadata.other_kv_index,
             input_metadata.total_num_tokens,
         )
 
@@ -88,12 +88,12 @@ class Attention(nn.Module):
             input_metadata.token_to_kv_pool.get_key_buffer(),
             input_metadata.token_to_kv_pool.get_value_buffer(),
             o.view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.req_to_token_pool.req_to_token[:, input_metadata.step_layer, :],
+            input_metadata.req_to_token_pool.req_to_token,
             input_metadata.req_pool_indices,
             input_metadata.start_loc,
             input_metadata.seq_lens,
             input_metadata.max_seq_len,
-            input_metadata.other_kv_index[input_metadata.step_layer].item(),
+            input_metadata.other_kv_index.item(),
             input_metadata.total_num_tokens,
         )
 
@@ -131,8 +131,8 @@ class Attention(nn.Module):
     def store_kv_cache_partial(self, cache_k, cache_v, input_metadata: InputMetadata):
         key_buffer = input_metadata.token_to_kv_pool.get_key_buffer()
         value_buffer = input_metadata.token_to_kv_pool.get_value_buffer()
-        if input_metadata.out_cache_loc is not None and input_metadata.step_layer is not None:
-            key_buffer[input_metadata.out_cache_loc[input_metadata.step_layer]] = cache_k
-            value_buffer[input_metadata.out_cache_loc[input_metadata.step_layer]] = cache_v
+        if input_metadata.out_cache_loc is not None:
+            key_buffer[input_metadata.out_cache_loc] = cache_k
+            value_buffer[input_metadata.out_cache_loc] = cache_v
         else:
             raise RuntimeError()

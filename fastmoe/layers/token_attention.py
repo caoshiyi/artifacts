@@ -56,6 +56,7 @@ def _fwd_kernel_stage1(
             mask=offs_n_new < cur_batch_end_index,
             other=0,
         )
+        k_loc = k_loc.to(tl.int64)
         offs_buf_k = (
             k_loc[:, None] * stride_buf_kbs
             + cur_kv_head * stride_buf_kh
@@ -120,6 +121,7 @@ def _fwd_kernel_stage2(
             mask=(start_n + offs_n) < cur_batch_seq_len,
             other=other_kv_index,
         )
+        v_index = v_index.to(tl.int64)
 
         qk = tl.load(
             Logics

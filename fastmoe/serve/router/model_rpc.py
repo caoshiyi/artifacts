@@ -105,6 +105,11 @@ class ModelRpcServer(rpyc.Service):
         self.min_new_token_ratio = min(0.2 * server_args.schedule_conservativeness, 1.0)
         self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
 
+        # todo @caoshiyi, profile
+        self.max_bs = 400
+        self.max_new_tokens = 40000
+        self.max_output_len = 32
+
     def flush_cache(self):
         if len(self.forward_queue) == 0 and (
             self.running_batch is None or len(self.running_batch.reqs) == 0
@@ -151,19 +156,33 @@ class ModelRpcServer(rpyc.Service):
     
     @torch.inference_mode()
     def batch_forward_step(self):
+        num_buffers = 2
         micro_batches = self.generate_micro_batches()
         print("Num Micro Batches:", len(micro_batches))
-        
+        prefetch_stream = torch.cuda.Stream()
+        offload_stream = torch.cuda.Stream()
+        load_stream = torch.cuda.Stream()
         # prefill
+        step_num_layers, prefetch_experts, new_micro_batches = self.shuffle_micro_batches(micro_batches)
+        with torch.cuda.stream(prefetch_stream):
+            self.model_runner.model.prefetch_expert(prefetch_experts[0])
+        torch.cuda.synchronize()
         while micro_batches[0].cur_layer < self.model_config.num_hidden_layers:
-            step_num_layers, prefetch_experts, new_micro_batches = self.shuffle_micro_batches(micro_batches)
-            # todo @caoshiyi, do this for each micro batch, use different streams for prefetch, offload and compute
-            self.model_runner.model.prefetch_expert(prefetch_experts)
-            for micro_batch in new_micro_batches:
-                self.forward_partial_fill_batch(micro_batch, step_num_layers)
-                micro_batch.offload_kv_cache()
+            prefetch_layer = micro_batches[0].cur_layer + 1 if micro_batches[0].cur_layer < self.model_config.num_hidden_layers - 1 else 0
+            for i, micro_batch in enumerate(new_micro_batches):
+                self.forward_partial_fill_batch(micro_batch, step_num_layers, i%num_buffers)
+                # with torch.cuda.stream(load_stream):
+                #     if new_micro_batches[(i+1)% len(new_micro_batches)].hidden_states is not None:
+                #         new_micro_batches[(i+1)% len(new_micro_batches)].hidden_states = new_micro_batches[(i+1)% len(new_micro_batches)].hidden_states.to('cuda', non_blocking=True)
+                with torch.cuda.stream(offload_stream):
+                    micro_batch.offload_kv_cache()
+                    # if micro_batch.hidden_states is not None:
+                    #     micro_batch.hidden_states = micro_batch.hidden_states.to('cpu', non_blocking=True)
                 micro_batch.cur_layer += step_num_layers
-                
+            with torch.cuda.stream(prefetch_stream):
+                self.model_runner.model.prefetch_expert(prefetch_experts[prefetch_layer])
+            
+
         # decode
         decode_step = 0
         while True:
@@ -180,27 +199,34 @@ class ModelRpcServer(rpyc.Service):
                 break
             micro_batches = new_micro_batches
             print("decode_step:", decode_step)
+            for micro_batch in new_micro_batches:
+                # Build batch tensors
+                micro_batch.prepare_for_partial_decode()
             while micro_batches[0].cur_layer < self.model_config.num_hidden_layers:
-                step_num_layers, prefetch_experts, new_micro_batches = self.shuffle_micro_batches(micro_batches)
-                self.model_runner.model.prefetch_expert(prefetch_experts)
-                for micro_batch in new_micro_batches:
-                    if micro_batch.cur_layer == 0:
-                        # Build batch tensors
-                        micro_batch.prepare_for_partial_decode()
-                    micro_batch.load_kv_cache(step_num_layers)
+                with torch.cuda.stream(load_stream):
+                    micro_batches[0].load_kv_cache()
+                prefetch_layer = micro_batches[0].cur_layer + 1 if micro_batches[0].cur_layer < self.model_config.num_hidden_layers - 1 else 0
+                for i, micro_batch in enumerate(new_micro_batches):
+                    # with torch.cuda.stream(load_stream):
+                    #     micro_batch.load_kv_cache()
                     self.forward_partial_decode_batch(micro_batch, step_num_layers)
-                    micro_batch.offload_kv_cache()
+                    if i < len(new_micro_batches) - 1:
+                        with torch.cuda.stream(load_stream):
+                            new_micro_batches[i+1].load_kv_cache()
+                    with torch.cuda.stream(offload_stream):
+                        micro_batch.offload_kv_cache()
                     micro_batch.cur_layer += step_num_layers
+                with torch.cuda.stream(prefetch_stream):
+                    self.model_runner.model.prefetch_expert(prefetch_experts[prefetch_layer])
             decode_step += 1
 
     def shuffle_micro_batches(self, micro_batches):
-        next_layer = micro_batches[0].cur_layer
         # todo @caoshiyi, advanced schedule
-        prefetch_experts = [(next_layer + i, j) for j in range(8) for i in range(4)]
-        return 4, prefetch_experts, micro_batches
+        prefetch_experts = [[(next_layer + i, j) for j in range(8) for i in range(1)] for next_layer in range(32)]
+        return 1, prefetch_experts, micro_batches
 
     # todo @caoshiyi, init_step_num_layers as a parameter
-    def generate_micro_batches(self, init_step_num_layers=4):
+    def generate_micro_batches(self, init_step_num_layers=1):
         micro_batches = []
         cpu_available_size = self.token_to_kv_pool.cpu_available_size()
         while cpu_available_size > 0:
@@ -217,7 +243,7 @@ class ModelRpcServer(rpyc.Service):
                     (req.input_len + req.max_new_tokens() + new_batch_total_tokens) * init_step_num_layers
                     < available_size
                     and req.input_len + new_batch_input_tokens
-                    < self.max_prefill_num_token and len(can_run_list) < 256
+                    < self.max_prefill_num_token and len(can_run_list) < 400
                 ):
 
                     can_run_list.append(req)
@@ -241,14 +267,13 @@ class ModelRpcServer(rpyc.Service):
             print("Append new micro batch. #reqs:", len(new_batch.reqs), "new_batch_input_tokens:", new_batch_input_tokens)
         return micro_batches
     
-    def forward_partial_fill_batch(self, batch: Batch, step_num_layers):
+    def forward_partial_fill_batch(self, batch: Batch, step_num_layers, buffer_idx=0):
         if batch.cur_layer == 0:
             # Build batch tensors
             batch.prepare_for_partial(
-                self.model_config.vocab_size, self.int_token_logit_bias
+                self.model_config.vocab_size, self.int_token_logit_bias, self.model_config.num_hidden_layers,
+                self.max_bs, self.max_new_tokens, self.max_output_len, buffer_idx
             )
-        
-        batch.prepare_for_partial_memory(step_num_layers)
 
         if batch.new_num_tokens != 0:
             if batch.cur_layer + step_num_layers != self.model_config.num_hidden_layers:
@@ -268,6 +293,8 @@ class ModelRpcServer(rpyc.Service):
 
                 next_token_ids, next_token_probs = batch.sample(logits)
                 next_token_ids = next_token_ids.cpu().tolist()
+                batch.hidden_states = None
+                batch.residual = None
         else:
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
             logprobs = normalized_logprobs = None
@@ -583,19 +610,19 @@ class ModelRpcServer(rpyc.Service):
 
         # Remove finished reqs
         if finished_indices:
-            req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
-            req_cpu_pool_indices_cpu = batch.req_cpu_pool_indices.cpu().tolist()
-            for i in finished_indices:
-                req = batch.reqs[i]
-                req_pool_idx = req_pool_indices_cpu[i]
-                req_cpu_pool_idx = req_cpu_pool_indices_cpu[i]
-                token_ids = tuple(req.input_ids + req.output_ids)
-                seq_len = len(token_ids) - 1
-                indices = self.req_to_token_pool.req_to_token[req_pool_idx, :, :seq_len]
+            # req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+            # req_cpu_pool_indices_cpu = batch.req_cpu_pool_indices.cpu().tolist()
+            # for i in finished_indices:
+            #     req = batch.reqs[i]
+            #     req_pool_idx = req_pool_indices_cpu[i]
+            #     # req_cpu_pool_idx = req_cpu_pool_indices_cpu[i]
+            #     token_ids = tuple(req.input_ids + req.output_ids)
+            #     seq_len = len(token_ids) - 1
+                # indices = self.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
 
-                self.token_to_kv_pool.free(indices.flatten())
-                self.req_to_token_pool.free(req_pool_idx)
-                self.req_to_cpu_token_pool.free(req_cpu_pool_idx)
+                # self.token_to_kv_pool.free(indices.flatten())
+                # self.req_to_token_pool.free(req_pool_idx)
+                # self.req_to_cpu_token_pool.free(req_cpu_pool_idx)
 
             # Update batch tensors
             if unfinished_indices:

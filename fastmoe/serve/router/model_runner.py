@@ -62,7 +62,7 @@ class InputMetadata:
     token_to_kv_pool: TokenToKVPool
 
     # offload states
-    step_layer: int = None
+    step_layer: int = 0
     out_cache_loc: torch.Tensor = None
     out_cache_cont_start: torch.Tensor = None
     out_cache_cont_end: torch.Tensor = None
@@ -98,7 +98,7 @@ class InputMetadata:
         elif forward_mode == ForwardMode.PARTIAL_DECODE:
             positions = ((seq_lens - 1) + position_ids_offsets).to(torch.int64)
             other_kv_index = model_runner.req_to_token_pool.req_to_token[
-                req_pool_indices[0], :, seq_lens[0] - 1
+                req_pool_indices[0], seq_lens[0] - 1
             ]
         else:
             seq_lens_np = seq_lens.cpu().numpy()
@@ -179,14 +179,14 @@ class ModelRunner:
         ) * (1 << 30)
         page_size = 3 * self.model_config.hidden_size * self.model_config.hf_config.intermediate_size // self.tp_size
         # todo profile expert pool size
-        self.expert_pool = MemoryPool(4*8,
+        self.expert_pool = MemoryPool(16,
                                       torch.float16,
                                       page_size,
                                       "expert_pool")
         self.load_model()
         # todo
-        max_step_num_layers = 4
-        total_cpu_memory = 0.4 * get_available_cpu_memory() * (1 << 30)
+        max_step_num_layers = self.model_config.num_hidden_layers
+        total_cpu_memory = 0.7 * get_available_cpu_memory() * (1 << 30)
         self.init_memory_pool(total_gpu_memory, total_cpu_memory, max_step_num_layers)
 
     def load_model(self):
@@ -247,21 +247,23 @@ class ModelRunner:
                 "Not enought memory. " "Please try to increase --mem-fraction-static."
             )
         self.req_to_token_pool = None
-        self.req_to_cpu_token_pool = None
-        # todo *10? 
+        self.req_to_cpu_token_pool = None 
+        print(self.max_total_num_token)
+        # todo @shiyi, automatically set these sizes
         self.req_to_token_pool = ReqToTokenPool(
-            int(self.max_total_num_token / max_step_num_layers / self.model_config.context_len * 256),
-            self.model_config.context_len + 8,
-            max_step_num_layers,
+            int(900),
+            int(self.model_config.context_len/32) + 8,
+            device="cuda",
         )
         self.req_to_cpu_token_pool = ReqToTokenPool(
-            int(self.max_num_offload_token / self.model_config.context_len * 256),
-            self.model_config.context_len + 8,
-            self.model_config.num_hidden_layers,
+            int(self.max_num_offload_token / self.model_config.context_len * 290),
+            int(self.model_config.context_len/32) + 8,
             device="cpu",
         )
+        print(self.max_num_offload_token)
+        print(int(self.model_config.context_len/32) + 8)
         self.token_to_kv_pool = TokenToKVPool(
-            self.max_total_num_token,
+            105600,
             self.max_num_offload_token,
             dtype=torch.float16,
             head_num=self.model_config.num_key_value_heads // self.tp_size,
@@ -329,6 +331,7 @@ class ModelRunner:
         return_logprob,
         hidden_states,
         residual,
+        cur_layers,
     ):
         input_metadata = InputMetadata.create(
             self,
@@ -340,7 +343,7 @@ class ModelRunner:
             out_cache_loc=out_cache_loc,
             return_logprob=return_logprob,
         )
-        return self.model.forward(input_ids, input_metadata.positions, input_metadata, hidden_states, residual)
+        return self.model.forward(input_ids, input_metadata.positions, input_metadata, hidden_states, residual, cur_layers)
     
     @torch.inference_mode()
     def forward_partial_decode(
@@ -352,6 +355,7 @@ class ModelRunner:
         out_cache_loc,
         hidden_states,
         residual,
+        cur_layers,
         out_cache_cont_start,
         out_cache_cont_end,
     ):
@@ -366,7 +370,7 @@ class ModelRunner:
             out_cache_cont_start=out_cache_cont_start,
             out_cache_cont_end=out_cache_cont_end,
         )
-        return self.model.forward(input_ids, input_metadata.positions, input_metadata, hidden_states, residual)
+        return self.model.forward(input_ids, input_metadata.positions, input_metadata, hidden_states, residual, cur_layers)
         
 
     def forward(self, batch: Batch, forward_mode: ForwardMode, return_logprob=False):
@@ -390,10 +394,12 @@ class ModelRunner:
             kwargs["return_logprob"] = return_logprob
             kwargs["hidden_states"] = batch.hidden_states
             kwargs["residual"] = batch.residual
+            kwargs["cur_layers"] = [batch.cur_layer]
             return self.forward_partial(**kwargs)
         elif forward_mode == ForwardMode.PARTIAL_DECODE:
             kwargs["hidden_states"] = batch.hidden_states
             kwargs["residual"] = batch.residual
+            kwargs["cur_layers"] = [batch.cur_layer]
             kwargs["out_cache_cont_start"] = batch.out_cache_cont_start
             kwargs["out_cache_cont_end"] = batch.out_cache_cont_end
             return self.forward_partial_decode(**kwargs)
