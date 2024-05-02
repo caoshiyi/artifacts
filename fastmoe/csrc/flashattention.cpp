@@ -7,9 +7,13 @@
 #include <ATen/ATen.h>
 #include <torch/extension.h>
 
-namespace {                
+namespace {
+#define FASTMOE_DISPATCH_CASE_FLOATING_TYPES(...)                                 \
+  AT_DISPATCH_CASE(at::kFloat, __VA_ARGS__)                         \
+  AT_DISPATCH_CASE(at::kHalf, __VA_ARGS__)
+              
 #define FASTMOE_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)                          \
-  AT_DISPATCH_SWITCH(TYPE, NAME, AT_DISPATCH_CASE(at::kFloat, __VA_ARGS__))
+  AT_DISPATCH_SWITCH(TYPE, NAME, FASTMOE_DISPATCH_CASE_FLOATING_TYPES(__VA_ARGS__))       \
 
 inline c10::SymFloat calculate_scale(
     const at::Tensor& query,
@@ -152,166 +156,213 @@ inline void fill_stub(scalar_t* data, scalar_t val, int64_t size) {
   }
 }
 
-template <typename scalar_t, int64_t q_split_size, int64_t kv_split_size>
-void cpu_flash_decode(
-    const torch::Tensor& output,
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& seq_lens,
-    const at::Tensor& start_loc,
-    c10::optional<double> scale) {
-  // Query -> (Batch x 1 x Num_Q_heads  x Dim_per_head)
-  // Key -> ([kv_seq_len1, kv_seq_len2, ...] x Num_KV_heads  x Dim_per_head)
-  // Value -> ([kv_seq_len1, kv_seq_len2, ...] x Num_KV_heads  x Dim_per_head)
+template <typename scalar_t>
+void gemm_dispatch (
+    CBLAS_LAYOUT layout,
+    CBLAS_TRANSPOSE transA,
+    CBLAS_TRANSPOSE transB,
+    int64_t m, int64_t n, int64_t k,
+    at::opmath_type<scalar_t> alpha,
+    const scalar_t* a, int64_t lda,
+    const scalar_t* b, int64_t ldb,
+    at::opmath_type<scalar_t> beta,
+    at::opmath_type<scalar_t>* c, int64_t ldc);
 
-  constexpr bool is_reduced_type = std::is_reduced_floating_point_v<scalar_t>;
-  using accum_t = at::opmath_type<scalar_t>;
-  using Vec = at::vec::Vectorized<accum_t>;
-  accum_t scaling_factor = calculate_scale(query, scale).as_float_unchecked();
-
-  // Sizes
-  TORCH_CHECK((query.size(3) == value.size(2)) && (key.size(2) == value.size(2)),
-        "token_attention_cpu: Q/K/V should have the same head size");
-  int64_t batchSize = query.size(0);
-  int64_t qSize = query.size(1);
-  int64_t num_head = query.size(2);
-  int64_t headSize = query.size(3);
-  int64_t num_kv_head = key.size(1);
-
-  // Strides
-  int64_t qStrideB = query.stride(0);
-  int64_t qStrideM = query.stride(1);
-  int64_t qStrideH = query.stride(2);
-  // int64_t kStrideB = key.stride(0);
-  // int64_t kStrideN = key.stride(1);
-  // int64_t kStrideH = key.stride(2);
-  // int64_t vStrideB = value.stride(0);
-  // int64_t vStrideN = value.stride(1);
-  // int64_t vStrideH = value.stride(2);
-  int64_t kStrideN = key.stride(0);
-  int64_t kStrideH = key.stride(1);
-  int64_t vStrideN = value.stride(0);
-  int64_t vStrideH = value.stride(1);
-  int64_t oStrideB = output.stride(0);
-  int64_t oStrideM = output.stride(1);
-  int64_t oStrideH = output.stride(2);
-
-  int64_t qSplitSize = q_split_size > qSize ? qSize : q_split_size;
-  int64_t kvSplitSize = kv_split_size;
-  int64_t qSlice = (qSize - 1) / qSplitSize + 1;
-  int64_t num_thread = at::get_num_threads();
-  int64_t kv_group_num = num_head / num_kv_head;
-
-  const auto dtype = query.scalar_type();
-  const auto accumulate_dtype = at::toOpMathType(dtype);
-
-  // allocate per thread temp buf (accumulate type)
-  int64_t size_per_thread =
-      /* qk     */ qSplitSize * kvSplitSize +
-      /* qk_max */ qSplitSize +
-      /* qk_sum */ qSplitSize +
-      /* dst    */ qSplitSize * headSize;
-
-  at::Tensor buf = at::zeros({num_thread, size_per_thread}, query.options().dtype(accumulate_dtype));
-  at::Tensor buf_reduced = at::zeros({num_thread, qSplitSize, is_reduced_type ? kvSplitSize : 0}, query.options());
-
-  // Data ptrs
-  const scalar_t* q_data = query.const_data_ptr<scalar_t>();
-  const scalar_t* k_data = key.const_data_ptr<scalar_t>();
-  const scalar_t* v_data = value.const_data_ptr<scalar_t>();
-  const int64_t* seq_lens_data = seq_lens.data_ptr<int64_t>();
-  const int64_t* start_loc_data = start_loc.data_ptr<int64_t>();
-  scalar_t* out_data = output.data_ptr<scalar_t>();
-  accum_t* buf_data = buf.data_ptr<accum_t>();
-  scalar_t* buf_reduced_data = is_reduced_type ? buf_reduced.data_ptr<scalar_t>() : nullptr;
-
-  at::parallel_for(0, batchSize * num_head * qSlice, 1, [&](int64_t begin, int64_t end) {
-    int64_t i = 0, j = 0, k = 0;
-    data_index_init(begin, i, batchSize, j, num_head, k, qSlice);
-    int ompIdx = at::get_thread_num();
-    accum_t* buf_ptr = buf_data + ompIdx * size_per_thread;
-    accum_t* qk_data = buf_ptr;
-    accum_t* qk_max_data = qk_data + qSplitSize * kvSplitSize;
-    accum_t* qk_sum_data = qk_max_data + qSplitSize;
-    accum_t* dst_data = qk_sum_data + qSplitSize;
-    scalar_t* qk_reduced_data = is_reduced_type ? buf_reduced_data + ompIdx * qSplitSize * kvSplitSize : nullptr;
-
-    for (const auto z : c10::irange(begin, end)) {
-      (void)z; // Suppress unused variable
-      int64_t m = k * qSplitSize;
-      int64_t qBlockSize = std::min(qSplitSize, qSize - m);
-      // Initialize max and sum
-      fill_stub(qk_max_data,
-          -std::numeric_limits<accum_t>::infinity(), qBlockSize);
-      fill_stub(qk_sum_data,
-          static_cast<accum_t>(0), qBlockSize);
-      int64_t num_keys = seq_lens_data[i];
-      int64_t start_pos = start_loc_data[i];
-      int64_t j_kv = j / kv_group_num;
-      for (int64_t n = 0; n < num_keys; n += kvSplitSize) {
-        int64_t kvBlockSize = std::min(kvSplitSize, num_keys - n);
-        // Calculate scale * q @ k.T
-        cblas_sgemv(
-            CblasRowMajor,
-            CblasNoTrans,
-            kvBlockSize,
-            headSize,
-            scaling_factor,
-            k_data + j_kv * kStrideH + (start_pos + n) * kStrideN,
-            kStrideN,
-            q_data + i * qStrideB + j * qStrideH,
-            1,
-            static_cast<accum_t>(0),
-            qk_data,
-            1);
-        
-        // Update coefficients with Softmax
-        accum_t tmp_max = 0, tmp_sum = 0, exp_tmp = 0;
-        _vec_max_kernel(
-            qk_data,
-            kvBlockSize,
-            tmp_max);
-        tmp_max = qk_max_data[0] > tmp_max ? qk_max_data[0] : tmp_max;
-        tmp_sum = tmp_max;
-        _exp_reduce_sum_fusion_kernel(
-            qk_data, 
-            kvBlockSize,
-            conditional_data_ptr(qk_data, qk_reduced_data),
-            tmp_sum);
-        exp_tmp = std::exp(qk_max_data[0] - tmp_max);
-        qk_sum_data[0] = tmp_sum + exp_tmp * qk_sum_data[0];
-        qk_max_data[0] = tmp_max;
-
-        // Calculate Softmax(q @ k.T) @ v
-        cblas_sgemv(
-            CblasRowMajor,
-            CblasTrans,
-            kvBlockSize,
-            headSize,
-            static_cast<accum_t>(1),
-            v_data + j_kv * vStrideH + (start_pos + n) * vStrideN,
-            vStrideN,
-            conditional_data_ptr(qk_data, qk_reduced_data),
-            1,
-            n == 0 ? static_cast<accum_t>(0) : exp_tmp,
-            dst_data,
-            1);
-      }
-      // dst <- dst / sum[row]
-      // reorder MHA output with strides)
-      accum_t sum_reciprocal = 1 / qk_sum_data[0];
-      at::vec::map<scalar_t>(
-        [sum_reciprocal](Vec x) { return x * Vec(sum_reciprocal); },
-        out_data + i * oStrideB + j * oStrideH + m * oStrideM,
-        dst_data,
-        headSize);
-      // Move to the next query
-      data_index_step(i, batchSize, j, num_head, k, qSlice);
-    }
-  });
-
+template <>
+void gemm_dispatch<float> (
+    CBLAS_LAYOUT layout,
+    CBLAS_TRANSPOSE transA,
+    CBLAS_TRANSPOSE transB,
+    int64_t m, int64_t n, int64_t k,
+    float alpha,
+    const float* a, int64_t lda,
+    const float* b, int64_t ldb,
+    float beta,
+    float* c, int64_t ldc) {
+  cblas_sgemm(
+      layout, transA, transB,
+      m, n, k,
+      alpha, a, lda, b, ldb, beta, c, ldc);
 }
+
+template <>
+void gemm_dispatch<at::Half> (
+    CBLAS_LAYOUT layout,
+    CBLAS_TRANSPOSE transA,
+    CBLAS_TRANSPOSE transB,
+    int64_t m, int64_t n, int64_t k,
+    float alpha,
+    const at::Half* a, int64_t lda,
+    const at::Half* b, int64_t ldb,
+    float beta,
+    float* c, int64_t ldc) {
+  cblas_gemm_f16f16f32(
+      layout, transA, transB,
+      m, n, k,
+      alpha, (MKL_F16*) a, lda, (MKL_F16*) b, ldb, beta, c, ldc);
+}
+
+
+// template <typename scalar_t, int64_t q_split_size, int64_t kv_split_size>
+// void cpu_flash_decode(
+//     const torch::Tensor& output,
+//     const at::Tensor& query,
+//     const at::Tensor& key,
+//     const at::Tensor& value,
+//     const at::Tensor& seq_lens,
+//     const at::Tensor& start_loc,
+//     c10::optional<double> scale) {
+//   // Query -> (Batch x 1 x Num_Q_heads  x Dim_per_head)
+//   // Key -> ([kv_seq_len1, kv_seq_len2, ...] x Num_KV_heads  x Dim_per_head)
+//   // Value -> ([kv_seq_len1, kv_seq_len2, ...] x Num_KV_heads  x Dim_per_head)
+
+//   constexpr bool is_reduced_type = std::is_reduced_floating_point_v<scalar_t>;
+//   using accum_t = at::opmath_type<scalar_t>;
+//   using Vec = at::vec::Vectorized<accum_t>;
+//   accum_t scaling_factor = calculate_scale(query, scale).as_float_unchecked();
+
+//   // Sizes
+//   TORCH_CHECK((query.size(3) == value.size(2)) && (key.size(2) == value.size(2)),
+//         "token_attention_cpu: Q/K/V should have the same head size");
+//   int64_t batchSize = query.size(0);
+//   int64_t qSize = query.size(1);
+//   int64_t num_head = query.size(2);
+//   int64_t headSize = query.size(3);
+//   int64_t num_kv_head = key.size(1);
+
+//   // Strides
+//   int64_t qStrideB = query.stride(0);
+//   int64_t qStrideM = query.stride(1);
+//   int64_t qStrideH = query.stride(2);
+//   // int64_t kStrideB = key.stride(0);
+//   // int64_t kStrideN = key.stride(1);
+//   // int64_t kStrideH = key.stride(2);
+//   // int64_t vStrideB = value.stride(0);
+//   // int64_t vStrideN = value.stride(1);
+//   // int64_t vStrideH = value.stride(2);
+//   int64_t kStrideN = key.stride(0);
+//   int64_t kStrideH = key.stride(1);
+//   int64_t vStrideN = value.stride(0);
+//   int64_t vStrideH = value.stride(1);
+//   int64_t oStrideB = output.stride(0);
+//   int64_t oStrideM = output.stride(1);
+//   int64_t oStrideH = output.stride(2);
+
+//   int64_t qSplitSize = q_split_size > qSize ? qSize : q_split_size;
+//   int64_t kvSplitSize = kv_split_size;
+//   int64_t qSlice = (qSize - 1) / qSplitSize + 1;
+//   int64_t num_thread = at::get_num_threads();
+//   int64_t kv_group_num = num_head / num_kv_head;
+
+//   const auto dtype = query.scalar_type();
+//   const auto accumulate_dtype = at::toOpMathType(dtype);
+
+//   // allocate per thread temp buf (accumulate type)
+//   int64_t size_per_thread =
+//       /* qk     */ qSplitSize * kvSplitSize +
+//       /* qk_max */ qSplitSize +
+//       /* qk_sum */ qSplitSize +
+//       /* dst    */ qSplitSize * headSize;
+
+//   at::Tensor buf = at::zeros({num_thread, size_per_thread}, query.options().dtype(accumulate_dtype));
+//   at::Tensor buf_reduced = at::zeros({num_thread, qSplitSize, is_reduced_type ? kvSplitSize : 0}, query.options());
+
+//   // Data ptrs
+//   const scalar_t* q_data = query.const_data_ptr<scalar_t>();
+//   const scalar_t* k_data = key.const_data_ptr<scalar_t>();
+//   const scalar_t* v_data = value.const_data_ptr<scalar_t>();
+//   const int64_t* seq_lens_data = seq_lens.data_ptr<int64_t>();
+//   const int64_t* start_loc_data = start_loc.data_ptr<int64_t>();
+//   scalar_t* out_data = output.data_ptr<scalar_t>();
+//   accum_t* buf_data = buf.data_ptr<accum_t>();
+//   scalar_t* buf_reduced_data = is_reduced_type ? buf_reduced.data_ptr<scalar_t>() : nullptr;
+
+//   at::parallel_for(0, batchSize * num_head * qSlice, 1, [&](int64_t begin, int64_t end) {
+//     int64_t i = 0, j = 0, k = 0;
+//     data_index_init(begin, i, batchSize, j, num_head, k, qSlice);
+//     int ompIdx = at::get_thread_num();
+//     accum_t* buf_ptr = buf_data + ompIdx * size_per_thread;
+//     accum_t* qk_data = buf_ptr;
+//     accum_t* qk_max_data = qk_data + qSplitSize * kvSplitSize;
+//     accum_t* qk_sum_data = qk_max_data + qSplitSize;
+//     accum_t* dst_data = qk_sum_data + qSplitSize;
+//     scalar_t* qk_reduced_data = is_reduced_type ? buf_reduced_data + ompIdx * qSplitSize * kvSplitSize : nullptr;
+
+//     for (const auto z : c10::irange(begin, end)) {
+//       (void)z; // Suppress unused variable
+//       int64_t m = k * qSplitSize;
+//       int64_t qBlockSize = std::min(qSplitSize, qSize - m);
+//       // Initialize max and sum
+//       fill_stub(qk_max_data,
+//           -std::numeric_limits<accum_t>::infinity(), qBlockSize);
+//       fill_stub(qk_sum_data,
+//           static_cast<accum_t>(0), qBlockSize);
+//       int64_t num_keys = seq_lens_data[i];
+//       int64_t start_pos = start_loc_data[i];
+//       int64_t j_kv = j / kv_group_num;
+//       for (int64_t n = 0; n < num_keys; n += kvSplitSize) {
+//         int64_t kvBlockSize = std::min(kvSplitSize, num_keys - n);
+//         // Calculate scale * q @ k.T
+//         cblas_sgemv(
+//             CblasRowMajor,
+//             CblasNoTrans,
+//             kvBlockSize,
+//             headSize,
+//             scaling_factor,
+//             k_data + j_kv * kStrideH + (start_pos + n) * kStrideN,
+//             kStrideN,
+//             q_data + i * qStrideB + j * qStrideH,
+//             1,
+//             static_cast<accum_t>(0),
+//             qk_data,
+//             1);
+        
+//         // Update coefficients with Softmax
+//         accum_t tmp_max = 0, tmp_sum = 0, exp_tmp = 0;
+//         _vec_max_kernel(
+//             qk_data,
+//             kvBlockSize,
+//             tmp_max);
+//         tmp_max = qk_max_data[0] > tmp_max ? qk_max_data[0] : tmp_max;
+//         tmp_sum = tmp_max;
+//         _exp_reduce_sum_fusion_kernel(
+//             qk_data, 
+//             kvBlockSize,
+//             conditional_data_ptr(qk_data, qk_reduced_data),
+//             tmp_sum);
+//         exp_tmp = std::exp(qk_max_data[0] - tmp_max);
+//         qk_sum_data[0] = tmp_sum + exp_tmp * qk_sum_data[0];
+//         qk_max_data[0] = tmp_max;
+
+//         // Calculate Softmax(q @ k.T) @ v
+//         cblas_sgemv(
+//             CblasRowMajor,
+//             CblasTrans,
+//             kvBlockSize,
+//             headSize,
+//             static_cast<accum_t>(1),
+//             v_data + j_kv * vStrideH + (start_pos + n) * vStrideN,
+//             vStrideN,
+//             conditional_data_ptr(qk_data, qk_reduced_data),
+//             1,
+//             n == 0 ? static_cast<accum_t>(0) : exp_tmp,
+//             dst_data,
+//             1);
+//       }
+//       // dst <- dst / sum[row]
+//       // reorder MHA output with strides)
+//       accum_t sum_reciprocal = 1 / qk_sum_data[0];
+//       at::vec::map<scalar_t>(
+//         [sum_reciprocal](Vec x) { return x * Vec(sum_reciprocal); },
+//         out_data + i * oStrideB + j * oStrideH + m * oStrideM,
+//         dst_data,
+//         headSize);
+//       // Move to the next query
+//       data_index_step(i, batchSize, j, num_head, k, qSlice);
+//     }
+//   });
+
+// }
 
 template <typename scalar_t, int64_t q_split_size, int64_t kv_split_size>
 void cpu_flash_decode_gqa(
@@ -406,8 +457,8 @@ void cpu_flash_decode_gqa(
       for (int64_t n = 0; n < num_keys; n += kvSplitSize) {
         int64_t kvBlockSize = std::min(kvSplitSize, num_keys - n);
         // Calculate scale * q @ k.T
-        // query (kv_group_num, head_size), key (kvBlockSize, head_size), 
-        cblas_sgemm(
+        // query (kv_group_num, head_size), key (kvBlockSize, head_size),
+        gemm_dispatch<scalar_t>(
             CblasRowMajor,
             CblasNoTrans,
             CblasTrans,
@@ -449,7 +500,7 @@ void cpu_flash_decode_gqa(
 
         // Calculate Softmax(q @ k.T) @ v
         // qk (kv_group_num, kvBlockSize), v (kvBlockSize, head_size)
-        cblas_sgemm(
+        gemm_dispatch<scalar_t>(
             CblasRowMajor,
             CblasNoTrans,
             CblasNoTrans,
@@ -496,7 +547,7 @@ void flash_attention_kernel_impl(
 
   FASTMOE_DISPATCH_FLOATING_TYPES(query.scalar_type(), "cpu_flash_decode", [&] {
     if (q_head == kv_head) {
-      cpu_flash_decode<scalar_t, 32, 1024>(
+      cpu_flash_decode_gqa<scalar_t, 32, 1024>(
         output, query, key, value, seq_lens, start_loc, scale);
     } else {
       cpu_flash_decode_gqa<scalar_t, 32, 1024>(

@@ -2,7 +2,10 @@
 ```
 git clone https://github.com/caoshiyi/FastMoE.git
 cd FastMoE
-
+conda create -n fastmoe python=3.11
+conda activate fastmoe
+conda install onemkl-sycl-blas
+conda install mkl-include
 pip install -e .
 ```
 

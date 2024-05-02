@@ -21,17 +21,20 @@ kv_head_num = 8
 head_dim = 128
 query = torch.empty(BS, 1, head_num, head_dim, dtype=torch.float16, device="cuda")
 query.uniform_(-1e-3, 1e-3)
-query_cpu = query.to("cpu").to(torch.float32)
+# query_cpu = query.to("cpu").to(torch.float32)
+query_cpu = query.to("cpu")
 query = query.view(BS, head_num, head_dim)
 
 k_cache = torch.empty(sum(seq_len_list), kv_head_num, head_dim, dtype=torch.float16, device="cuda")
 k_cache.uniform_(-1e-3, 1e-3)
-k_cache_cpu = k_cache.to("cpu").to(torch.float32)
+# k_cache_cpu = k_cache.to("cpu").to(torch.float32)
+k_cache_cpu = k_cache.to("cpu")
 
 
 v_cache = torch.empty(sum(seq_len_list), kv_head_num, head_dim, dtype=torch.float16, device="cuda")
 v_cache.uniform_(-1e-3, 1e-3)
-v_cache_cpu = v_cache.to("cpu").to(torch.float32)
+# v_cache_cpu = v_cache.to("cpu").to(torch.float32)
+v_cache_cpu = v_cache.to("cpu")
 
 padded_k_cache = torch.zeros((BS, seq_len, kv_head_num, head_dim), dtype=torch.float32, device="cpu")
 padded_v_cache = torch.zeros((BS, seq_len, kv_head_num, head_dim), dtype=torch.float32, device="cpu")
@@ -88,7 +91,8 @@ torch.cuda.synchronize()
 print("GPU elapsed time: ", (time.time() - start)/10)
 
 # torch sdp
-out = torch.zeros(BS, 1, head_num, head_dim, dtype=torch.float32, device="cpu")
+# out = torch.zeros(BS, 1, head_num, head_dim, dtype=torch.float32, device="cpu")
+out = torch.zeros(BS, 1, head_num, head_dim, dtype=torch.float16, device="cpu")
 seq_lens_tensor = torch.tensor(seq_len_list, device="cpu")
 start = time.time()
 for i in range(10):

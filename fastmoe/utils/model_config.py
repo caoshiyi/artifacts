@@ -27,3 +27,4 @@ class ModelConfig:
         self.hidden_size = self.hf_config.hidden_size
         self.num_hidden_layers = self.hf_config.num_hidden_layers
         self.vocab_size = self.hf_config.vocab_size
+        self.num_local_experts = self.hf_config.num_local_experts

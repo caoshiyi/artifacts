@@ -13,6 +13,16 @@ class ForwardMode(Enum):
     PARTIAL = auto()
     PARTIAL_DECODE = auto()
 
+class DecodePart(Enum):
+    CPU_ATTN = auto()
+    PREATTN = auto()
+    POSTATTN = auto()
+    ALL = auto()
+
+class KVLayout(Enum):
+    Continuous = auto()
+    Interleave = auto()
+
 
 class FinishReason(Enum):
     LENGTH = auto()
@@ -93,14 +103,22 @@ class Batch:
     buffer_idx: int = None
     pt: int = None
     total_num_layers: int = None
+    start_loc: torch.Tensor = None
+    decode_out_cache_loc: torch.Tensor = None
     # intermediate results
     hidden_states: torch.Tensor = None
     residual: torch.Tensor = None
+    qkv_pin: torch.Tensor = None
+    hidden_pin: torch.Tensor = None
+    # async results
+    attn_future: torch.jit.Future[torch.Tensor] = None
+    qkv: torch.Tensor = None
 
     # batched arguments to model runner
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
     seq_lens: torch.Tensor = None
+    seq_lens_cpu: torch.Tensor = None
     position_ids_offsets: torch.Tensor = None
     out_cache_loc: torch.Tensor = None
     out_cache_cont_start: torch.Tensor = None
@@ -172,9 +190,11 @@ class Batch:
         self.seq_lens.add_(1)
         self.out_cache_cont_start = None
         self.out_cache_cont_end = None
+        self.decode_out_cache_loc.add_(1)
+        self.seq_lens_cpu = (self.seq_lens - 1).to("cpu")
 
     
-    def prepare_for_partial(self, vocab_size: int, int_token_logit_bias: torch.Tensor, total_num_layers:int, max_bs:int, max_new_tokens:int, max_output_len: int, buffer_idx: int):
+    def prepare_for_partial(self, vocab_size: int, int_token_logit_bias: torch.Tensor, total_num_layers:int, max_bs:int, max_new_tokens:int, max_output_len: int, buffer_idx: int, kvlayout: KVLayout, num_q_heads:int = None):
         device = "cuda"
         bs = len(self.reqs)
         reqs = self.reqs
@@ -201,17 +221,50 @@ class Batch:
         self.cpu_indices = self.token_to_kv_pool.alloc_cpu(buffer_size)
         self.virtual_mapping_offset = self.cpu_indices[0] - self.gpu_start_index
         self.mem_state = torch.ones((buffer_size,), dtype=torch.bool, device="cuda")
-        pt = 0
-        for i in range(bs):
-            seq_len = len(self.reqs[i].input_ids)
-            self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices[i]][:seq_len] = self.cpu_indices[pt : pt + seq_len] - self.virtual_mapping_offset
-            pt += seq_len
-        self.out_cache_loc = (self.cpu_indices[: pt] - self.virtual_mapping_offset).to('cuda')
-        self.pt = pt
-        self.mem_state[:self.pt] = 0
+        # for kvcache offloading
+        if kvlayout == KVLayout.Interleave:
+            pt = 0
+            for i in range(bs):
+                seq_len = len(self.reqs[i].input_ids)
+                self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices[i]][:seq_len] = self.cpu_indices[pt : pt + seq_len] - self.virtual_mapping_offset
+                pt += seq_len
+            self.out_cache_loc = (self.cpu_indices[: pt] - self.virtual_mapping_offset).to('cuda')
+            self.pt = pt
+            self.mem_state[:self.pt] = 0
         
-        self.req_cpu_pool_indices = req_cpu_pool_indices
-        self.req_pool_indices = torch.arange(buffer_idx * max_bs, buffer_idx * max_bs + bs, device=device, dtype=torch.int32)
+            self.req_cpu_pool_indices = req_cpu_pool_indices
+            self.req_pool_indices = torch.arange(buffer_idx * max_bs, buffer_idx * max_bs + bs, device=device, dtype=torch.int32)
+        elif kvlayout == KVLayout.Continuous: # for cpu attention
+            self.out_cache_loc = torch.zeros_like(self.cpu_indices[: new_num_tokens])
+            self.decode_out_cache_loc = torch.zeros_like(self.cpu_indices[: bs])
+            start_loc = torch.zeros((bs,), dtype=torch.int64, device="cpu")
+            pt = 0
+            out_cache_pt = 0
+            for i in range(bs):
+                seq_len = len(self.reqs[i].input_ids)
+                start_loc[i] = self.cpu_indices[pt]
+                self.req_to_cpu_token_pool.req_to_token[req_cpu_pool_indices[i]][:seq_len + max_output_len] = self.cpu_indices[pt : pt + seq_len + max_output_len]
+                self.out_cache_loc[out_cache_pt : out_cache_pt + seq_len] = self.cpu_indices[pt : pt + seq_len] - self.virtual_mapping_offset
+                self.decode_out_cache_loc[i] = self.cpu_indices[pt + seq_len]
+                pt += seq_len + max_output_len
+                out_cache_pt += seq_len
+            self.out_cache_loc = self.out_cache_loc.to('cuda')
+            self.pt = pt
+            self.mem_state[:self.pt] = 0
+        
+            self.req_cpu_pool_indices = req_cpu_pool_indices
+            self.req_pool_indices = torch.arange(buffer_idx * max_bs, buffer_idx * max_bs + bs, device=device, dtype=torch.int32)
+            self.start_loc = start_loc
+            n_kv_heads = self.token_to_kv_pool.kv_data.shape[2]
+            head_dim = self.token_to_kv_pool.kv_data.shape[3]
+            
+            dtype = self.token_to_kv_pool.dtype
+            self.qkv_pin = torch.empty((bs, (num_q_heads + 2 * n_kv_heads) * head_dim), dtype=dtype, device="cpu").pin_memory()
+            self.hidden_pin = torch.empty((bs, 1, num_q_heads, head_dim), dtype=dtype, device="cpu").pin_memory()
+            self.compute_event = torch.cuda.Event()
+            self.offload_event = torch.cuda.Event()
+            self.load_event = torch.cuda.Event()
+            self.attn_event = torch.cuda.Event()
 
         # Handle logit bias
         logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
@@ -223,7 +276,7 @@ class Batch:
         self.input_ids = torch.tensor(
             flatten_input_ids, dtype=torch.int32, device=device
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         self.position_ids_offsets = position_ids_offsets
         self.new_num_tokens = new_num_tokens
 

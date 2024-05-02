@@ -110,6 +110,7 @@ class TokenToKVPool:
         self.cpu_mem_state = torch.zeros((cpu_size,), dtype=torch.int16, device="cpu")
         self.alloc_ct = 0
         self.alloc_ct_cpu = 0
+        self.dtype = dtype
 
         # [size, key/value, head_num, head_dim] for each layer
         self.kv_data = torch.empty((gpu_size, 2, head_num, head_dim), dtype=dtype, device="cuda")
@@ -170,6 +171,12 @@ class TokenToKVPool:
 
     def get_value_buffer(self):
         return self.kv_data[:, 1]
+    
+    def get_key_buffer_cpu(self, layer):
+        return self.kv_data_cpu[layer][:, 0]
+    
+    def get_value_buffer_cpu(self, layer):
+        return self.kv_data_cpu[layer][:, 1]
 
     def alloc(self, need_size):
         select_index = torch.nonzero(self.gpu_mem_state == 0).squeeze(1)[:need_size]

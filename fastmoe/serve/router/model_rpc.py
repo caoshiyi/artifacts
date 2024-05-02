@@ -18,7 +18,7 @@ from fastmoe.serve.io_struct import (
     TokenizedGenerateReqInput,
     BatchTokenizedGenerateReqInput,
 )
-from fastmoe.serve.router.infer_batch import Batch, ForwardMode, Req
+from fastmoe.serve.router.infer_batch import Batch, ForwardMode, Req, DecodePart, KVLayout
 from fastmoe.serve.router.model_runner import ModelRunner
 from fastmoe.serve.router.scheduler import Scheduler
 from fastmoe.serve.server_args import PortArgs, ServerArgs
@@ -159,9 +159,16 @@ class ModelRpcServer(rpyc.Service):
         num_buffers = 2
         micro_batches = self.generate_micro_batches()
         print("Num Micro Batches:", len(micro_batches))
+        # workers and streams
+        cpu_executor = ThreadPoolExecutor(max_workers=1)
+        copy_executor = ThreadPoolExecutor(max_workers=1)
         prefetch_stream = torch.cuda.Stream()
         offload_stream = torch.cuda.Stream()
         load_stream = torch.cuda.Stream()
+        cur_stream = torch.cuda.current_stream()
+        prefetch_events = [torch.cuda.Event() for _ in range(len(micro_batches))]
+        copy_futures = [None for _ in range(len(micro_batches))]
+
         # prefill
         step_num_layers, prefetch_experts, new_micro_batches = self.shuffle_micro_batches(micro_batches)
         with torch.cuda.stream(prefetch_stream):
@@ -170,11 +177,12 @@ class ModelRpcServer(rpyc.Service):
         while micro_batches[0].cur_layer < self.model_config.num_hidden_layers:
             prefetch_layer = micro_batches[0].cur_layer + 1 if micro_batches[0].cur_layer < self.model_config.num_hidden_layers - 1 else 0
             for i, micro_batch in enumerate(new_micro_batches):
-                self.forward_partial_fill_batch(micro_batch, step_num_layers, i%num_buffers)
+                self.forward_partial_fill_batch(micro_batch, micro_batch.cur_layer, step_num_layers, i%num_buffers)
                 # with torch.cuda.stream(load_stream):
                 #     if new_micro_batches[(i+1)% len(new_micro_batches)].hidden_states is not None:
                 #         new_micro_batches[(i+1)% len(new_micro_batches)].hidden_states = new_micro_batches[(i+1)% len(new_micro_batches)].hidden_states.to('cuda', non_blocking=True)
                 with torch.cuda.stream(offload_stream):
+                    micro_batch.attn_event.wait(offload_stream)
                     micro_batch.offload_kv_cache()
                     # if micro_batch.hidden_states is not None:
                     #     micro_batch.hidden_states = micro_batch.hidden_states.to('cpu', non_blocking=True)
@@ -182,8 +190,9 @@ class ModelRpcServer(rpyc.Service):
             with torch.cuda.stream(prefetch_stream):
                 self.model_runner.model.prefetch_expert(prefetch_experts[prefetch_layer])
             
-
         # decode
+        # total_partitions = 1 if len(new_micro_batches) <= len(prefetch_experts[0]) else math.ceil(len(new_micro_batches) / len(prefetch_experts[0]))
+        total_partitions = 1
         decode_step = 0
         while True:
             new_micro_batches = []
@@ -202,27 +211,93 @@ class ModelRpcServer(rpyc.Service):
             for micro_batch in new_micro_batches:
                 # Build batch tensors
                 micro_batch.prepare_for_partial_decode()
+            
+            # Prologue
+            for i, micro_batch in enumerate(new_micro_batches[:2]):
+                # PREATTN and CPU_ATTN for [0, 0] and [1, 0]
+                self.forward_partial_decode_batch(micro_batch, step_num_layers, DecodePart.PREATTN, micro_batch.cur_layer)
+                micro_batch.compute_event.record()
+                with torch.cuda.stream(offload_stream):
+                    micro_batch.compute_event.wait(offload_stream)
+                    micro_batch.qkv_pin.copy_(micro_batch.qkv, non_blocking=True)
+                    micro_batch.offload_event.record(offload_stream)
+                micro_batch.attn_future = cpu_executor.submit(self.forward_partial_decode_batch, micro_batch, step_num_layers, DecodePart.CPU_ATTN, micro_batch.cur_layer)
+                # prefetch W[1, i] to pin
+                copy_futures[i] = copy_executor.submit(self.model_runner.model.prefetch_experts_to_pin, 1, 
+                                                        i // total_partitions, 
+                                                        i // len(prefetch_experts[0]), 
+                                                        total_partitions, 
+                                                        prefetch_events[i])
+
             while micro_batches[0].cur_layer < self.model_config.num_hidden_layers:
-                with torch.cuda.stream(load_stream):
-                    micro_batches[0].load_kv_cache()
+                prefetch_events[-1].wait(cur_stream)
                 prefetch_layer = micro_batches[0].cur_layer + 1 if micro_batches[0].cur_layer < self.model_config.num_hidden_layers - 1 else 0
+                
                 for i, micro_batch in enumerate(new_micro_batches):
-                    # with torch.cuda.stream(load_stream):
-                    #     micro_batch.load_kv_cache()
-                    self.forward_partial_decode_batch(micro_batch, step_num_layers)
-                    if i < len(new_micro_batches) - 1:
-                        with torch.cuda.stream(load_stream):
-                            new_micro_batches[i+1].load_kv_cache()
-                    with torch.cuda.stream(offload_stream):
-                        micro_batch.offload_kv_cache()
+                    micro_batch.attn_future.result()
+
+                    # POSTATTN for [i, j]
+                    with torch.cuda.stream(load_stream):
+                        micro_batch.hidden_states = micro_batch.hidden_pin.to('cuda', non_blocking=True)
+                        micro_batch.load_event.record(load_stream)
+                        if i < len(prefetch_experts[prefetch_layer]) * total_partitions:
+                            copy_futures[i].result()
+                            self.model_runner.model.prefetch_experts_from_pin(prefetch_layer, 
+                                                                              i // total_partitions, 
+                                                                              i // len(prefetch_experts[0]), 
+                                                                              total_partitions)
+                            prefetch_events[i].record(load_stream)
+                    
+                    micro_batch.load_event.wait(cur_stream)
+                    self.forward_partial_decode_batch(micro_batch, step_num_layers, DecodePart.POSTATTN, micro_batch.cur_layer)
+                    
+                    if i + 2 < len(new_micro_batches):
+                        # PREATTN and CPU_ATTN for [i+2, j] (j < num_layers)
+                        pre_micro_batch = new_micro_batches[i+2]
+                        self.forward_partial_decode_batch(pre_micro_batch, step_num_layers, DecodePart.PREATTN, micro_batch.cur_layer)
+                        pre_micro_batch.compute_event.record()
+                        with torch.cuda.stream(offload_stream):
+                            pre_micro_batch.compute_event.wait(offload_stream)
+                            pre_micro_batch.qkv_pin.copy_(pre_micro_batch.qkv, non_blocking=True)
+                            pre_micro_batch.offload_event.record(offload_stream)
+                        pre_micro_batch.attn_future = cpu_executor.submit(self.forward_partial_decode_batch, pre_micro_batch, step_num_layers, DecodePart.CPU_ATTN, micro_batch.cur_layer)
+                        # prefetch weights to pin
+                        if i + 2 < len(prefetch_experts[prefetch_layer]) * total_partitions:
+                            copy_futures[i + 2] = copy_executor.submit(self.model_runner.model.prefetch_experts_to_pin, 
+                                                                       prefetch_layer,  
+                                                                        (i + 2) // total_partitions,
+                                                                        (i + 2) // len(prefetch_experts[0]),
+                                                                        total_partitions, 
+                                                                        prefetch_events[i + 2])
+                    elif i + 2 >= len(new_micro_batches) and micro_batch.cur_layer < self.model_config.num_hidden_layers - 1:
+                        # PREATTN for [(i+2)%B, j+1] (j < num_layers - 1)
+                        pre_micro_batch = new_micro_batches[(i+2)%len(new_micro_batches)]
+                        assert pre_micro_batch.cur_layer < self.model_config.num_hidden_layers
+                        self.forward_partial_decode_batch(pre_micro_batch, step_num_layers, DecodePart.PREATTN, micro_batch.cur_layer + 1)
+                        pre_micro_batch.compute_event.record()
+                        with torch.cuda.stream(offload_stream):
+                            pre_micro_batch.compute_event.wait(offload_stream)
+                            pre_micro_batch.qkv_pin.copy_(pre_micro_batch.qkv, non_blocking=True)
+                            pre_micro_batch.offload_event.record(offload_stream)
+                        pre_micro_batch.attn_future = cpu_executor.submit(self.forward_partial_decode_batch, pre_micro_batch, step_num_layers, DecodePart.CPU_ATTN, micro_batch.cur_layer + 1)
+                        # prefetch weights to pin
+                        copy_futures[(i + 2)%len(new_micro_batches)] = copy_executor.submit(self.model_runner.model.prefetch_experts_to_pin, 
+                                                                                            (prefetch_layer + 1) % self.model_config.num_hidden_layers, 
+                                                                                            (i + 2)%len(new_micro_batches) // total_partitions, 
+                                                                                            (i + 2)%len(new_micro_batches) // len(prefetch_experts[0]), 
+                                                                                            total_partitions, 
+                                                                                            prefetch_events[(i + 2)%len(new_micro_batches)])
+                    
                     micro_batch.cur_layer += step_num_layers
-                with torch.cuda.stream(prefetch_stream):
-                    self.model_runner.model.prefetch_expert(prefetch_experts[prefetch_layer])
+                # with torch.cuda.stream(prefetch_stream):
+                #     self.model_runner.model.prefetch_expert(prefetch_experts[prefetch_layer])
             decode_step += 1
 
     def shuffle_micro_batches(self, micro_batches):
         # todo @caoshiyi, advanced schedule
-        prefetch_experts = [[(next_layer + i, j) for j in range(8) for i in range(1)] for next_layer in range(32)]
+        num_hidden_layers = self.model_config.num_hidden_layers
+        num_experts = self.model_config.num_local_experts
+        prefetch_experts = [[(next_layer + i, j) for j in range(num_experts) for i in range(1)] for next_layer in range(num_hidden_layers)]
         return 1, prefetch_experts, micro_batches
 
     # todo @caoshiyi, init_step_num_layers as a parameter
@@ -267,25 +342,26 @@ class ModelRpcServer(rpyc.Service):
             print("Append new micro batch. #reqs:", len(new_batch.reqs), "new_batch_input_tokens:", new_batch_input_tokens)
         return micro_batches
     
-    def forward_partial_fill_batch(self, batch: Batch, step_num_layers, buffer_idx=0):
-        if batch.cur_layer == 0:
+    def forward_partial_fill_batch(self, batch: Batch, cur_layer, step_num_layers, buffer_idx=0):
+        if cur_layer == 0:
             # Build batch tensors
             batch.prepare_for_partial(
                 self.model_config.vocab_size, self.int_token_logit_bias, self.model_config.num_hidden_layers,
-                self.max_bs, self.max_new_tokens, self.max_output_len, buffer_idx
+                self.max_bs, self.max_new_tokens, self.max_output_len, buffer_idx, kvlayout=KVLayout.Continuous, num_q_heads=self.model_config.num_attention_heads
             )
 
         if batch.new_num_tokens != 0:
-            if batch.cur_layer + step_num_layers != self.model_config.num_hidden_layers:
-                print("batch.cur_layer:", batch.cur_layer, "step_num_layers:", step_num_layers)
+            if cur_layer + step_num_layers != self.model_config.num_hidden_layers:
+                print("cur_layer:", cur_layer, "step_num_layers:", step_num_layers)
                 # partial forward
                 batch.hidden_states, batch.residual = self.model_runner.forward(
-                    batch, ForwardMode.PARTIAL, batch.return_logprob
+                    batch, ForwardMode.PARTIAL, DecodePart.ALL, cur_layer, batch.return_logprob
                 )
             else:
+                print("cur_layer:", cur_layer, "step_num_layers:", step_num_layers)
                 # last layer forward
                 logits, (logprobs, normalized_logprobs) = self.model_runner.forward(
-                    batch, ForwardMode.PARTIAL, batch.return_logprob
+                    batch, ForwardMode.PARTIAL, DecodePart.ALL, cur_layer, batch.return_logprob
                 )
                 if logprobs is not None:
                     logprobs = logprobs.cpu().tolist()
@@ -299,7 +375,7 @@ class ModelRpcServer(rpyc.Service):
             next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
             logprobs = normalized_logprobs = None
 
-        if batch.cur_layer + step_num_layers == self.model_config.num_hidden_layers:
+        if cur_layer + step_num_layers == self.model_config.num_hidden_layers:
             # Check finish condition
             reqs = batch.reqs
             pt = 0
@@ -314,28 +390,38 @@ class ModelRpcServer(rpyc.Service):
 
             self.handle_finished_requests(batch, ForwardMode.PARTIAL)
 
-    def forward_partial_decode_batch(self, batch: Batch, step_num_layers):
+    def forward_partial_decode_batch(self, batch: Batch, step_num_layers, decode_part: DecodePart, cur_layer: int):
+        print("cur_layer:", cur_layer, "step_num_layers:", step_num_layers, "decode_part:", decode_part)
         
-        if batch.cur_layer + step_num_layers != self.model_config.num_hidden_layers:
-            print("batch.cur_layer:", batch.cur_layer, "step_num_layers:", step_num_layers)
+        if decode_part == DecodePart.CPU_ATTN:
+            batch.offload_event.synchronize()
+            return self.model_runner.forward(
+                batch, ForwardMode.PARTIAL_DECODE, decode_part, cur_layer
+            )
+        elif decode_part == DecodePart.PREATTN:
+            batch.qkv, batch.residual = self.model_runner.forward(
+                batch, ForwardMode.PARTIAL_DECODE, decode_part, cur_layer
+            )
+        elif cur_layer + step_num_layers != self.model_config.num_hidden_layers:
             # partial decode
             batch.hidden_states, batch.residual = self.model_runner.forward(
-                batch, ForwardMode.PARTIAL_DECODE
+                batch, ForwardMode.PARTIAL_DECODE, decode_part, cur_layer
             )
         else:
             # last layer forward
-            logits, _ = self.model_runner.forward(batch, ForwardMode.PARTIAL_DECODE)
+            logits, _ = self.model_runner.forward(batch, ForwardMode.PARTIAL_DECODE, decode_part, cur_layer)
             next_token_ids, next_token_probs = batch.sample(logits)
             next_token_ids = next_token_ids.cpu().tolist()
 
-        if batch.cur_layer + step_num_layers == self.model_config.num_hidden_layers:
-            # Check finish condition
-            reqs = batch.reqs
-            for i in range(len(reqs)):
-                reqs[i].output_ids.append(next_token_ids[i])
-                reqs[i].check_finished()
+        if cur_layer + step_num_layers == self.model_config.num_hidden_layers :
+            if decode_part == DecodePart.ALL or decode_part == DecodePart.POSTATTN:
+                # Check finish condition
+                reqs = batch.reqs
+                for i in range(len(reqs)):
+                    reqs[i].output_ids.append(next_token_ids[i])
+                    reqs[i].check_finished()
 
-            self.handle_finished_requests(batch, ForwardMode.PARTIAL_DECODE)
+                self.handle_finished_requests(batch, ForwardMode.PARTIAL_DECODE)
     
     @torch.inference_mode()
     def forward_step(self):

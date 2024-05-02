@@ -28,6 +28,7 @@ from transformers import MixtralConfig
 from tqdm import tqdm
 import time
 
+from fastmoe.serve.router.infer_batch import DecodePart
 from fastmoe.layers.attention import Attention
 from fastmoe.layers.stacked_fused_moe import stack_fused_moe
 from fastmoe.layers.linear import (LinearMethodBase,
@@ -81,6 +82,7 @@ class MixtralMoE(nn.Module):
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
+            print(f"Using default dtype {params_dtype}")
         self.params_dtype = params_dtype
 
         self.gates = StackedLinear(self.num_layers,
@@ -209,11 +211,24 @@ class MixtralAttention(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, input_metadata)
-        output, _ = self.o_proj(attn_output)
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.PREATTN:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+            if input_metadata.decode_part == DecodePart.PREATTN:
+                return torch.cat([q, k, v], dim=-1).contiguous()
+            
+        if input_metadata.decode_part == DecodePart.ALL:
+            attn_output = self.attn(q, k, v, input_metadata)
+            input_metadata.attn_event.record(torch.cuda.current_stream())
+        if input_metadata.decode_part == DecodePart.CPU_ATTN:
+            attn_output = self.attn(None, None, None, input_metadata)
+            return attn_output
+            
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+            if input_metadata.decode_part == DecodePart.POSTATTN:
+                attn_output = hidden_states
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -253,24 +268,36 @@ class MixtralDecoderLayer(nn.Module):
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.PREATTN:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+        
+        if input_metadata.decode_part == DecodePart.PREATTN:
+            qkv = self.self_attn(positions, hidden_states, input_metadata)
+            return qkv, residual
+        elif input_metadata.decode_part == DecodePart.CPU_ATTN:
+            attn_out = self.self_attn(positions, hidden_states, input_metadata)
+            return attn_out
+        elif input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+            # assert not torch.isnan(hidden_states).any(), "nan in POSTATTN input"
+            # Self Attention
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                input_metadata=input_metadata,
+            )
+            # check no nan in output
+            # assert not torch.isnan(hidden_states).any(), "nan in POSTATTN outputs"
+            # print("postattn:", hidden_states[:2, :2])
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            input_metadata=input_metadata,
-        )
-        # print(f"Layer {self.layer_id} hidden_states: {hidden_states[:10,:10]}")
+            hidden_states = self.block_sparse_moe(self.layer_id, hidden_states)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.block_sparse_moe(self.layer_id, hidden_states)
         return hidden_states, residual
 
 
@@ -317,7 +344,7 @@ class MixtralModel(nn.Module):
         residual: torch.Tensor = None,
         cur_layers: List[int] = None,
     ) -> torch.Tensor:
-        if hidden_states is None:
+        if hidden_states is None and input_ids is not None:
             hidden_states = self.embed_tokens(input_ids)
             residual = None
         if cur_layers is None:
@@ -327,9 +354,18 @@ class MixtralModel(nn.Module):
             # input_metadata.step_layer = i
             # torch.cuda.synchronize()
             # start = time.time()
-            hidden_states, residual = layer(positions, hidden_states,
-                                            input_metadata,
-                                            residual)
+            if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+                hidden_states, residual = layer(positions, hidden_states,
+                                                input_metadata,
+                                                residual)
+            elif input_metadata.decode_part == DecodePart.PREATTN:
+                qkv, residual = layer(positions, hidden_states,
+                                                input_metadata,
+                                                residual)
+                return qkv, residual
+            elif input_metadata.decode_part == DecodePart.CPU_ATTN:
+                attn_out = layer(None, None, input_metadata, None)
+                return attn_out
             # torch.cuda.synchronize()
             # print(f"Layer {i} time: {time.time() - start}")
         if cur_layers[-1] != len(self.layers) - 1:
@@ -365,34 +401,55 @@ class MixtralForCausalLMOff(nn.Module):
         residual: torch.Tensor = None,
         cur_layers: List[int] = None,
     ) -> torch.Tensor:
-        hidden_states, residual = self.model(input_ids, positions,
-                                   input_metadata, hidden_states=hidden_states, residual=residual, cur_layers=cur_layers)
+        if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
+            if hidden_states is not None:
+                hidden_states = hidden_states.view(-1, self.config.hidden_size)
+            hidden_states, residual = self.model(input_ids, positions,
+                                    input_metadata, hidden_states=hidden_states, residual=residual, cur_layers=cur_layers)
+        elif input_metadata.decode_part == DecodePart.PREATTN:
+            qkv, residual = self.model(input_ids, positions,
+                                    input_metadata, hidden_states=hidden_states, residual=residual, cur_layers=cur_layers)
+            return qkv, residual
+        elif input_metadata.decode_part == DecodePart.CPU_ATTN:
+            attn_out = self.model(input_ids, positions,
+                                    input_metadata, hidden_states=hidden_states, residual=residual, cur_layers=cur_layers)
+            return attn_out
         if self.config.num_hidden_layers - 1 not in cur_layers:
             return hidden_states, residual
         else:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head.weight, input_metadata
             )
-    
+        
     def prefetch_expert(self, experts: List[Tuple[int, int]]):
-        # if all(element in self.current_experts for element in experts):
-        #     return
-        # need_size = len(experts)
-        # indices = self.expert_pool.alloc(need_size)
-        # if indices is None:
-        #     self.evict_expert(self.current_experts[: len(experts)])
-        #     indices = self.expert_pool.alloc(need_size)
-        #     self.current_experts = self.current_experts[len(experts):]
-        # assert indices is not None, "Not enough memory for prefetch."
         start_pos = (experts[0][0] * self.config.num_local_experts + experts[0][1]) % self.expert_pool.size
         end_pos = start_pos + len(experts)
-        self.expert_pool.mem_data[start_pos:end_pos].copy_(self.model.block_sparse_moe.ws.data[experts[0][0], :], non_blocking=True)
-        # for i, (layer_id, expert_id) in enumerate(experts):
-        #     index = indices[i]
-        #     self.model.block_sparse_moe.ws.mapping[layer_id, expert_id] = index
-        # if len(self.current_experts) + len(experts) > self.expert_pool.size:
-        #     self.current_experts = self.current_experts[len(experts):]
-        # self.current_experts.extend(experts)
+        self.expert_pool.mem_data[start_pos:end_pos].copy_(self.model.block_sparse_moe.ws.data[experts[0][0], experts[0][1]:experts[0][1]+len(experts)], non_blocking=True)
+    
+    def relayed_prefetch_expert(self, experts: List[Tuple[int, int]], prefetch_stream, prefetch_event, wait_event):
+        wait_event.synchronize()
+        for i in range(len(experts)):
+            # copy to pin_mem first
+            self.experts_pin_buffer[i].copy_(self.model.block_sparse_moe.ws.data[experts[i][0], experts[i][1]])
+            buf_pos = (experts[i][0] * self.config.num_local_experts + experts[i][1]) % self.expert_pool.size
+            # copy to GPU
+            with torch.cuda.stream(prefetch_stream):
+                self.expert_pool.mem_data[buf_pos].copy_(self.experts_pin_buffer[i], non_blocking=True)
+        prefetch_event.record(prefetch_stream)
+    
+    def prefetch_experts_to_pin(self, layer_id, expert_id, partition_id, total_partition, wait_event):
+        wait_event.synchronize()
+        partition_size = self.expert_pool.mem_data.shape[1] // total_partition
+        start = partition_id * partition_size
+        end = min((partition_id + 1) * partition_size, self.expert_pool.mem_data.shape[1])
+        self.experts_pin_buffer[expert_id, start:end].copy_(self.model.block_sparse_moe.ws.data[layer_id, expert_id, start:end])
+    
+    def prefetch_experts_from_pin(self, layer_id, expert_id, partition_id, total_partition):
+        buf_pos = (layer_id * self.config.num_local_experts + expert_id) % self.expert_pool.size
+        partition_size = self.expert_pool.mem_data.shape[1] // total_partition
+        start = partition_id * partition_size
+        end = min((partition_id + 1) * partition_size, self.expert_pool.mem_data.shape[1])
+        self.expert_pool.mem_data[buf_pos, start:end].copy_(self.experts_pin_buffer[expert_id, start:end], non_blocking=True)
 
     def evict_expert(self, experts: List[Tuple[int, int]]):
         if not experts:
@@ -485,8 +542,10 @@ class MixtralForCausalLMOff(nn.Module):
         
         # self.model.block_sparse_moe.ws.data = self.model.block_sparse_moe.ws.data.pin_memory()
         # init mapping
-        for layer_id in range(32):  # Iterate over 32 layers
-            for expert_id in range(8):
+        for layer_id in range(self.config.num_hidden_layers):
+            for expert_id in range(self.config.num_local_experts):
                 self.model.block_sparse_moe.ws.mapping[layer_id, expert_id] = (layer_id * self.config.num_local_experts + expert_id) % self.expert_pool.size
+        
+        self.experts_pin_buffer = torch.empty((self.config.num_local_experts, 3 * self.config.intermediate_size * self.config.hidden_size), dtype=torch.get_default_dtype(), device="cpu").pin_memory()
 
 EntryClass = MixtralForCausalLMOff
