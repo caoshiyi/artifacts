@@ -310,9 +310,9 @@ class ModelRunner:
         total_gpu_memory = get_available_gpu_memory(
             self.tp_rank, distributed=self.tp_size > 1
         ) * (1 << 30)
-        page_size = 3 * self.model_config.hidden_size * self.model_config.hf_config.intermediate_size // self.tp_size
+        page_size = 3 * self.model_config.hidden_size * self.model_config.intermediate_size // self.tp_size
         # todo profile expert pool size
-        self.expert_pool = MemoryPool(16,
+        self.expert_pool = MemoryPool(32,
                                       torch.float16,
                                       page_size,
                                       "expert_pool")

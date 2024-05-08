@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "torch==2.1.2"]
+requires = ["setuptools>=61.0", "wheel", "torch==2.1.2", "py-cpuinfo"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,7 +13,7 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp", "fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
-       "zmq", "vllm>=0.2.7", "interegular", "lark", "numba",
+       "zmq", "vllm>=0.2.7, <0.4.1", "interegular", "lark", "numba",
        "pydantic", "referencing", "diskcache", "cloudpickle", "pillow",
 ]
 

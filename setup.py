@@ -2,18 +2,28 @@ from setuptools import setup, find_packages, Extension
 import os
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
+import cpuinfo
+
+def get_compile_args():
+    flags = ["-std=c++17", "-O1", "-fopenmp", "-Wno-ignored-qualifiers", "-mf16c"]
+    info = cpuinfo.get_cpu_info()
+
+    if 'avx512f' in info['flags']:
+        flags.extend(["-mavx512f", "-mavx512cd", "-mavx512vl"])
+    elif 'avx2' in info['flags']:
+        flags.extend(["-mavx2", "-mfma"])
+    return flags
 
 ext_modules = []
 ext_modules.append(
     Extension(
         name="fastmoe._cpu_kernel",
         sources=["fastmoe/csrc/flashattention.cpp"],
-        include_dirs=torch_cpp_ext.include_paths(),
+        include_dirs=torch.utils.cpp_extension.include_paths(),
         library_dirs=torch.utils.cpp_extension.library_paths(),
         libraries=['torch', 'c10', 'torch_cpu', 'torch_python', 'mkl_rt'],
         language="c++",
-        # extra_compile_args=["-std=c++17", "-O1", "-fopenmp", "-mavx2", "-mfma", "-mf16c", "-Wno-ignored-qualifiers"],
-        extra_compile_args=["-std=c++17", "-O1", "-fopenmp", "-mavx512f", "-mavx512cd", "-mavx512vl", "-mf16c", "-Wno-ignored-qualifiers"],
+        extra_compile_args=get_compile_args(),
         extra_link_args=['-lpthread', '-lm', '-ldl']
     )
 )
@@ -39,7 +49,7 @@ setup(
         "aiohttp",
         "fastapi",
         "zmq",
-        "vllm>=0.2.7",
+        "vllm>=0.2.7, <0.4.1",
         "rpyc",
         "torch==2.1.2",
         "uvloop",

@@ -47,6 +47,41 @@ CONTEXT_LENGTH_KEYS = [
     "model_max_length",
 ]
 
+NUM_LAYERS_KEYS = [
+    "num_hidden_layers",
+    "n_layers",
+]
+
+HIDDEN_SIZE_KEYS = [
+    "hidden_size",
+    "d_model",
+]
+
+NUM_ATTENTION_HEADS_KEYS = [
+    "num_attention_heads",
+    "n_heads",
+]
+
+NUM_KV_HEADS_KEYS = [
+    "num_key_value_heads",
+    "kv_n_heads",
+]
+
+INTERMEDIATE_SIZE_KEYS = [
+    "intermediate_size",
+    "ffn_hidden_size",
+]
+
+NUM_EXPERTS_KEYS = [
+    "moe_num_experts",
+    "num_local_experts"
+]
+
+TOPK_KEYS = [
+    "num_experts_per_token",
+    "moe_top_k",
+]
+
 
 def get_context_length(config):
     """Get the context length of a model from a huggingface model config."""
@@ -61,6 +96,67 @@ def get_context_length(config):
         if val is not None:
             return int(rope_scaling_factor * val)
     return 2048
+
+def get_num_layers(config):
+    for key in NUM_LAYERS_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    return 0
+
+def get_hidden_size(config):
+    for key in HIDDEN_SIZE_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    return 0
+
+def get_num_attention_heads(config):
+    for key in NUM_ATTENTION_HEADS_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    return 0
+
+def get_num_kv_heads(config):
+    attn_config = getattr(config, "attn_config", None)
+    if attn_config:
+        config = attn_config
+    for key in NUM_KV_HEADS_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    return None
+
+def get_intermediate_size(config):
+    ffn_config = getattr(config, "ffn_config", None)
+    if ffn_config:
+        config = ffn_config
+    for key in INTERMEDIATE_SIZE_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    return 0
+
+def get_num_experts(config):
+    ffn_config = getattr(config, "ffn_config", None)
+    if ffn_config:
+        config = ffn_config
+    for key in NUM_EXPERTS_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    return None
+
+def get_topk(config):
+    ffn_config = getattr(config, "ffn_config", None)
+    if ffn_config:
+        config = ffn_config
+    for key in TOPK_KEYS:
+        val = getattr(config, key, None)
+        if val is not None:
+            return val
+    return None
 
 
 # A fast LLaMA tokenizer with the pre-processed `tokenizer.json` file.

@@ -2,7 +2,10 @@ import os
 from typing import Optional, Union
 
 import torch
-from fastmoe.utils.hf_transformers_utils import get_config, get_context_length
+from fastmoe.utils.hf_transformers_utils import (get_config, get_context_length, 
+                                                get_num_layers, get_hidden_size, 
+                                                get_num_attention_heads, get_num_kv_heads, 
+                                                get_intermediate_size, get_num_experts, get_topk)
 
 
 class ModelConfig:
@@ -19,12 +22,13 @@ class ModelConfig:
 
         # Unify the config keys for hf_config
         self.context_len = get_context_length(self.hf_config)
-        self.head_dim = self.hf_config.hidden_size // self.hf_config.num_attention_heads
-        self.num_attention_heads = self.hf_config.num_attention_heads
-        self.num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)
+        self.head_dim =  get_hidden_size(self.hf_config) // get_num_attention_heads(self.hf_config)
+        self.num_attention_heads = get_num_attention_heads(self.hf_config)
+        self.num_key_value_heads = get_num_kv_heads(self.hf_config)
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-        self.hidden_size = self.hf_config.hidden_size
-        self.num_hidden_layers = self.hf_config.num_hidden_layers
+        self.hidden_size = get_hidden_size(self.hf_config)
+        self.num_hidden_layers = get_num_layers(self.hf_config)
         self.vocab_size = self.hf_config.vocab_size
-        self.num_local_experts = self.hf_config.num_local_experts
+        self.num_local_experts = get_num_experts(self.hf_config)
+        self.intermediate_size = get_intermediate_size(self.hf_config)

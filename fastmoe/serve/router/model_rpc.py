@@ -347,7 +347,7 @@ class ModelRpcServer(rpyc.Service):
             # Build batch tensors
             batch.prepare_for_partial(
                 self.model_config.vocab_size, self.int_token_logit_bias, self.model_config.num_hidden_layers,
-                self.max_bs, self.max_new_tokens, self.max_output_len, buffer_idx, kvlayout=KVLayout.Continuous, num_q_heads=self.model_config.num_attention_heads
+                self.max_bs, self.max_new_tokens, self.max_output_len, buffer_idx, kvlayout=KVLayout.Continuous, num_q_heads=self.model_config.num_attention_heads // self.tp_size
             )
 
         if batch.new_num_tokens != 0:
@@ -368,6 +368,7 @@ class ModelRpcServer(rpyc.Service):
                     normalized_logprobs = normalized_logprobs.cpu().tolist()
 
                 next_token_ids, next_token_probs = batch.sample(logits)
+                print(next_token_ids.shape)
                 next_token_ids = next_token_ids.cpu().tolist()
                 batch.hidden_states = None
                 batch.residual = None
