@@ -30,7 +30,7 @@ def main(args):
     length_of_inputs = gpu_batch_size * num_gpu_batches
     
     # Prompts
-    questions = load_questions("../mtbench/question.jsonl")
+    questions = load_questions("../../mtbench/question.jsonl")
     prompts = []
     for i in range(61):
         for question in questions:

@@ -43,8 +43,8 @@ class OptTokenizer:
         self.tokenizer = AutoTokenizer.from_pretrained(name, padding_side="left")
         self.tokenizer.add_bos_token = False
         
-        # TODO: adapt from mtbench run?
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        # TODO: adapt from mtbench run? shall we add this or not?
+        # self.tokenizer.pad_token = self.tokenizer.eos_token
         
         if 'galactica' in name:
             config = AutoConfig.from_pretrained(name)
@@ -240,11 +240,11 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
         timers("generate").reset()
         output_ids_tmp = model.generate(
             input_ids_tmp,
-            # do_sample=generation_args["do_sample"],
+            do_sample=generation_args["do_sample"],
             temperature=0,
             max_new_tokens=args.gen_len,
             # max_new_tokens=generation_args["max_new_tokens"],
-            # stop=generation_args.get("eos_token_id", None)
+            stop=generation_args.get("eos_token_id", None)
             )
         costs = timers("generate").costs
         input_ids_batches.append(input_ids_tmp)
