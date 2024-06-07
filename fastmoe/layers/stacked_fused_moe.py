@@ -174,7 +174,7 @@ def moe_align_block_size(
                                       device=topk_ids.device)
     ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
                              expert_ids, num_tokens_post_pad)
-    return sorted_ids, expert_ids, num_tokens_post_pad
+    return sorted_ids.to(torch.int64), expert_ids, num_tokens_post_pad
 
 
 def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, B_ind: torch.Tensor, C: torch.Tensor,
@@ -301,7 +301,7 @@ def stack_fused_moe(
     intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
-    intermediate_cache2 = torch.empty((M * topk_ids.shape[1], N // 2),
+    intermediate_cache2 = torch.zeros((M * topk_ids.shape[1], N // 2),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
     intermediate_cache3 = torch.empty((M, topk_ids.shape[1], H),
@@ -348,4 +348,4 @@ def stack_fused_moe(
 #     triton_output = stack_fused_moe(a, w1, indices, score, topk, renormalize=True, inplace=True)
 #     return triton_output
 
-# test_fused_moe(22, 14336, 4096, 8, 2, torch.float16)
+# test_fused_moe(40000, 14336, 4096, 8, 2, torch.float16)

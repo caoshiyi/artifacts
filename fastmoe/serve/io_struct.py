@@ -77,7 +77,6 @@ class BatchTokenizedGenerateReqInput:
     logprob_start_len: int
     stream: bool
 
-
 @dataclass
 class BatchTokenIDOut:
     rids: List[str]
@@ -94,8 +93,3 @@ class BatchStrOut:
     output_str: List[str]
     meta_info: List[Dict]
     finished: List[bool]
-
-
-@dataclass
-class FlushCacheReq:
-    pass

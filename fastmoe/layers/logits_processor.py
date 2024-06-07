@@ -1,5 +1,5 @@
 import torch
-from fastmoe.serve.router.model_runner import ForwardMode, InputMetadata
+from fastmoe.backend.task_meta import ForwardMode
 from torch import nn
 from vllm.model_executor.parallel_utils.communication_op import (
     get_tensor_model_parallel_world_size,
@@ -15,7 +15,7 @@ class LogitsProcessor(nn.Module):
 
     def forward(self, input_ids, hidden_states, weight, input_metadata):
         if not input_metadata.return_logprob:
-            if input_metadata.forward_mode == ForwardMode.DECODE or input_metadata.forward_mode == ForwardMode.PARTIAL_DECODE:
+            if input_metadata.forward_mode == ForwardMode.DECODE:
                 last_hidden = hidden_states
             else:
                 last_index = (

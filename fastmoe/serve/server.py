@@ -81,205 +81,6 @@ async def generate_request(obj: GenerateReqInput):
     ret = await tokenizer_manager.generate_request(obj).__anext__()
     return ret
 
-
-@app.post("/v1/completions")
-async def v1_completions(raw_request: Request):
-    request_json = await raw_request.json()
-    request = CompletionRequest(**request_json)
-
-    assert request.n == 1
-
-    adapted_request = GenerateReqInput(
-        text=request.prompt,
-        sampling_params={
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
-            "stop": request.stop,
-            "top_p": request.top_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-        },
-        stream=request.stream,
-    )
-    adapted_request.post_init()
-
-    if adapted_request.stream:
-
-        async def gnerate_stream_resp():
-            stream_buffer = ""
-            async for content in stream_generator(adapted_request):
-                text = content["text"]
-                prompt_tokens = content["meta_info"]["prompt_tokens"]
-                completion_tokens = content["meta_info"]["completion_tokens"]
-
-                delta = text[len(stream_buffer) :]
-                stream_buffer = text
-                choice_data = CompletionResponseStreamChoice(
-                    index=0,
-                    text=delta,
-                    logprobs=None,
-                    finish_reason=None,
-                )
-                chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    object="text_completion",
-                    choices=[choice_data],
-                    model=request.model,
-                    usage=UsageInfo(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        total_tokens=prompt_tokens + completion_tokens,
-                    ),
-                )
-                yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
-
-    # Non-streaming response.
-    ret = await generate_request(adapted_request)
-
-    choice_data = CompletionResponseChoice(
-        index=0,
-        text=ret["text"],
-        logprobs=None,
-        finish_reason=None,
-    )
-
-    prompt_tokens = ret["meta_info"]["prompt_tokens"]
-    completion_tokens = ret["meta_info"]["completion_tokens"]
-    response = CompletionResponse(
-        id=ret["meta_info"]["id"],
-        model=request.model,
-        choices=[choice_data],
-        usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
-    )
-    return response
-
-
-@app.post("/v1/chat/completions")
-async def v1_chat_completions(raw_request: Request):
-    request_json = await raw_request.json()
-    request = ChatCompletionRequest(**request_json)
-
-    assert request.n == 1
-
-    # Prep the data needed for the underlying GenerateReqInput:
-    #  - prompt: The full prompt string.
-    #  - stop: Custom stop tokens.
-    #  - image_data: None or a list of image strings (URLs or base64 strings).
-    #    None skips any image processing in GenerateReqInput.
-    if not isinstance(request.messages, str):
-        # Apply chat template and its stop strings.
-        if chat_template_name is None:
-            # This flow doesn't support the full OpenAI spec.  Verify messages
-            # has the right type before proceeding:
-            for m in request.messages:
-                if not isinstance(m.content, str):
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Structured content requests not supported with HuggingFace Chat Templates.  Make sure the server specifies a sglang chat template.",
-                    )
-            prompt = tokenizer_manager.tokenizer.apply_chat_template(
-                request.messages, tokenize=False, add_generation_prompt=True
-            )
-            stop = request.stop
-            image_data = None
-        else:
-            conv = generate_chat_conv(request, chat_template_name)
-            prompt = conv.get_prompt()
-            image_data = conv.image_data
-            stop = conv.stop_str or []
-            if request.stop:
-                if isinstance(request.stop, str):
-                    stop.append(request.stop)
-                else:
-                    stop.extend(request.stop)
-    else:
-        # Use the raw prompt and stop strings if the messages is already a string.
-        prompt = request.messages
-        stop = request.stop
-        image_data = None
-
-    adapted_request = GenerateReqInput(
-        text=prompt,
-        image_data=image_data,
-        sampling_params={
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
-            "stop": stop,
-            "top_p": request.top_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-        },
-        stream=request.stream,
-    )
-    adapted_request.post_init()
-
-    if adapted_request.stream:
-
-        async def gnerate_stream_resp():
-            is_first = True
-
-            stream_buffer = ""
-            async for content in stream_generator(adapted_request):
-                if is_first:
-                    # First chunk with role
-                    is_first = False
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=0,
-                        delta=DeltaMessage(role="assistant"),
-                        finish_reason=None,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        choices=[choice_data],
-                        model=request.model,
-                    )
-                    yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
-
-                text = content["text"]
-                delta = text[len(stream_buffer) :]
-                stream_buffer = text
-                choice_data = ChatCompletionResponseStreamChoice(
-                    index=0, delta=DeltaMessage(content=delta), finish_reason=None
-                )
-                chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    choices=[choice_data],
-                    model=request.model,
-                )
-                yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
-
-    # Non-streaming response.
-    ret = await generate_request(adapted_request)
-    prompt_tokens = ret["meta_info"]["prompt_tokens"]
-    completion_tokens = ret["meta_info"]["completion_tokens"]
-    choice_data = ChatCompletionResponseChoice(
-        index=0,
-        message=ChatMessage(role="assistant", content=ret["text"]),
-        finish_reason=None,
-    )
-    response = ChatCompletionResponse(
-        id=ret["meta_info"]["id"],
-        model=request.model,
-        choices=[choice_data],
-        usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
-    )
-    return response
-
-
 def launch_server(server_args, pipe_finish_writer):
     global tokenizer_manager
     global chat_template_name
@@ -408,6 +209,9 @@ class Runtime:
         load_format: str = "auto",
         tokenizer_mode: str = "auto",
         trust_remote_code: bool = True,
+        cpu_mem_bdw: float = None,
+        avg_prompt_len: int = 32,
+        gen_len: int = 1,
         mem_fraction_static: float = ServerArgs.mem_fraction_static,
         max_prefill_num_token: int = ServerArgs.max_prefill_num_token,
         tp_size: int = 1,
@@ -427,6 +231,9 @@ class Runtime:
             load_format=load_format,
             tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
+            cpu_mem_bdw=cpu_mem_bdw,
+            avg_prompt_len=avg_prompt_len,
+            gen_len=gen_len,
             mem_fraction_static=mem_fraction_static,
             max_prefill_num_token=max_prefill_num_token,
             tp_size=tp_size,

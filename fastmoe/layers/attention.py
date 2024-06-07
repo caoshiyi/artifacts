@@ -2,7 +2,7 @@ import torch
 from fastmoe._cpu_kernel import token_attention_cpu
 from fastmoe.layers.context_flashattention_nopad import context_attention_fwd
 from fastmoe.layers.token_attention import token_attention_fwd
-from fastmoe.serve.router.model_runner import ForwardMode, InputMetadata, DecodePart
+from fastmoe.backend.model_runner import ForwardMode, InputMetadata, DecodePart
 from torch import nn
 
 
@@ -25,10 +25,8 @@ class Attention(nn.Module):
 
         self.prefill_forward = self.prefill_forward_triton
         self.decode_forward = self.decode_forward_triton
-        self.partial_forward = self.partial_forward_triton
-        self.partial_decode_forward = self.partial_decode_forward_triton
         self.cpu_decode_forward = self.cpu_decode_forward_cpp
-
+    
     def prefill_forward_triton(self, q, k, v, input_metadata: InputMetadata):
         o = torch.empty_like(q)
 
@@ -45,61 +43,9 @@ class Attention(nn.Module):
 
         return o
     
-    def partial_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        o = torch.empty_like(q)
-
-        context_attention_fwd(
-            q.view(-1, self.tp_q_head_num, self.head_dim),
-            k,
-            v,
-            o.view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.start_loc,
-            input_metadata.seq_lens,
-            input_metadata.max_seq_len,
-        )
-        self.store_kv_cache_partial(k, v, input_metadata)
-
-        return o
-
+    # Unused for now
     def decode_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        o = torch.empty_like(q)
-        self.store_kv_cache(k, v, input_metadata)
-
-        token_attention_fwd(
-            q.view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id),
-            input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id),
-            o.view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.req_to_token_pool.req_to_token,
-            input_metadata.req_pool_indices,
-            input_metadata.start_loc,
-            input_metadata.seq_lens,
-            input_metadata.max_seq_len,
-            input_metadata.other_kv_index,
-            input_metadata.total_num_tokens,
-        )
-
-        return o
-    
-    def partial_decode_forward_triton(self, q, k, v, input_metadata: InputMetadata):
-        o = torch.empty_like(q)
-        self.store_kv_cache_partial(k, v, input_metadata)
-
-        token_attention_fwd(
-            q.view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.token_to_kv_pool.get_key_buffer(),
-            input_metadata.token_to_kv_pool.get_value_buffer(),
-            o.view(-1, self.tp_q_head_num, self.head_dim),
-            input_metadata.req_to_token_pool.req_to_token,
-            input_metadata.req_pool_indices,
-            input_metadata.start_loc,
-            input_metadata.seq_lens,
-            input_metadata.max_seq_len,
-            input_metadata.other_kv_index.item(),
-            input_metadata.total_num_tokens,
-        )
-
-        return o
+        pass
 
     def cpu_decode_forward_cpp(self, input_metadata: InputMetadata):
         qkv = input_metadata.qkv_pin.view(-1, self.tp_q_head_num + 2 * self.tp_k_head_num, self.head_dim)
@@ -109,7 +55,7 @@ class Attention(nn.Module):
 
         self.store_kv_cache_cpu(k, v, input_metadata)
         
-        print("query:", query[:4, 0, :2, :2], "layer:", self.layer_id)
+        # print("query:", query[:6, 0, :2, :2], "layer:", self.layer_id)
         token_attention_cpu(
             input_metadata.hidden_pin, query, 
             input_metadata.token_to_kv_pool.get_key_buffer_cpu(self.layer_id), 
@@ -118,7 +64,7 @@ class Attention(nn.Module):
             input_metadata.start_loc, 
             self.head_dim**-0.5
         )
-        print("hidden_pin:", input_metadata.hidden_pin[:4, 0, :2, :2])
+        # print("hidden_pin:", input_metadata.hidden_pin[:6, 0, :2, :2])
 
         return
     
@@ -130,42 +76,22 @@ class Attention(nn.Module):
         if input_metadata.forward_mode == ForwardMode.PREFILL:
             return self.prefill_forward(q, k, v, input_metadata)
         elif input_metadata.forward_mode == ForwardMode.DECODE:
-            return self.decode_forward(q, k, v, input_metadata)
-        elif input_metadata.forward_mode == ForwardMode.PARTIAL:
-            return self.partial_forward(q, k, v, input_metadata)
-        elif input_metadata.forward_mode == ForwardMode.PARTIAL_DECODE:
             if input_metadata.decode_part == DecodePart.CPU_ATTN:
                 return self.cpu_decode_forward_cpp(input_metadata)
             else:
-                return self.partial_decode_forward(q, k, v, input_metadata)
-
-    def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
-        key_buffer = input_metadata.token_to_kv_pool.get_key_buffer(self.layer_id)
-        value_buffer = input_metadata.token_to_kv_pool.get_value_buffer(self.layer_id)
-        if input_metadata.out_cache_loc is not None:
-            key_buffer[input_metadata.out_cache_loc] = cache_k
-            value_buffer[input_metadata.out_cache_loc] = cache_v
-        elif input_metadata.out_cache_cont_start is not None:
-            key_buffer[
-                input_metadata.out_cache_cont_start : input_metadata.out_cache_cont_end
-            ] = cache_k
-            value_buffer[
-                input_metadata.out_cache_cont_start : input_metadata.out_cache_cont_end
-            ] = cache_v
-        else:
-            raise RuntimeError()
+                return self.decode_forward(q, k, v, input_metadata)
         
     def store_kv_cache_cpu(self, cache_k, cache_v, input_metadata: InputMetadata):
         key_buffer = input_metadata.token_to_kv_pool.get_key_buffer_cpu(self.layer_id)
         value_buffer = input_metadata.token_to_kv_pool.get_value_buffer_cpu(self.layer_id)
-        key_buffer[input_metadata.out_cache_loc] = cache_k
-        value_buffer[input_metadata.out_cache_loc] = cache_v
+        key_buffer[input_metadata.out_cache_loc, :, :] = cache_k[:, :, :]
+        value_buffer[input_metadata.out_cache_loc, :, :] = cache_v[:, :, :]
     
-    def store_kv_cache_partial(self, cache_k, cache_v, input_metadata: InputMetadata):
+    def store_kv_cache(self, cache_k, cache_v, input_metadata: InputMetadata):
         key_buffer = input_metadata.token_to_kv_pool.get_key_buffer()
         value_buffer = input_metadata.token_to_kv_pool.get_value_buffer()
         if input_metadata.out_cache_loc is not None:
-            key_buffer[input_metadata.out_cache_loc] = cache_k
-            value_buffer[input_metadata.out_cache_loc] = cache_v
+            key_buffer[input_metadata.out_cache_loc, :, :] = cache_k[:, :, :]
+            value_buffer[input_metadata.out_cache_loc, :, :] = cache_v[:, : ,:]
         else:
             raise RuntimeError()

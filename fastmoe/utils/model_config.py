@@ -32,3 +32,4 @@ class ModelConfig:
         self.vocab_size = self.hf_config.vocab_size
         self.num_local_experts = get_num_experts(self.hf_config)
         self.intermediate_size = get_intermediate_size(self.hf_config)
+        self.topk = get_topk(self.hf_config)

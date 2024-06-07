@@ -1,25 +1,6 @@
 # coding=utf-8
 # Adapted from
-# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mixtral.py
 """Inference-only Mixtral model."""
 from typing import List, Optional, Tuple
 import torch
@@ -28,7 +9,7 @@ from transformers import MixtralConfig
 from tqdm import tqdm
 import time
 
-from fastmoe.serve.router.infer_batch import DecodePart
+from fastmoe.backend.task_meta import InputMetadata, DecodePart
 from fastmoe.layers.attention import Attention
 from fastmoe.layers.stacked_fused_moe import stack_fused_moe
 from fastmoe.layers.linear import (LinearMethodBase,
@@ -36,8 +17,6 @@ from fastmoe.layers.linear import (LinearMethodBase,
                                                StackedLinear,
                                                RowParallelLinear)
 from fastmoe.layers.logits_processor import LogitsProcessor
-from fastmoe.serve.router.model_runner import InputMetadata
-from fastmoe.backend.memory import MemoryPool
 
 
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -70,7 +49,6 @@ class MixtralMoE(nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         tp_size: Optional[int] = None,
-        memory_pool: Optional[MemoryPool] = None,
     ):
         super().__init__()
         self.tp_size = tp_size or get_tensor_model_parallel_world_size()
@@ -100,13 +78,6 @@ class MixtralMoE(nn.Module):
         set_weight_attrs(self.ws, {
             "weight_loader": self.weight_loader,
         })
-        # memory manager
-        set_weight_attrs(self.ws, {"mem": memory_pool})
-        # mapping from cpu mem to gpu mem (expert id -> indices)
-        # must use int64, since page size is large
-        indices = torch.empty((self.num_layers, self.num_total_experts), dtype=torch.int64, device="cuda")
-        indices.fill_(memory_pool.size)
-        set_weight_attrs(self.ws, {"mapping": indices}) 
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, expert_id: int, layer_id: int):
@@ -124,12 +95,12 @@ class MixtralMoE(nn.Module):
         if weight_name.endswith("w2.weight"):
             param_data[layer_id, expert_id, w2_offset:] = loaded_weight[:, shard].view(-1)
 
-    def forward(self, index:int, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, index:int, hidden_states: torch.Tensor, experts_cache: torch.Tensor) -> torch.Tensor:
         # router_logits: (n_token, n_experts)
         router_logits, _ = self.gates(index, hidden_states)
         final_hidden_states = stack_fused_moe(hidden_states,
-                                        self.ws.mem.mem_data,
-                                        self.ws.mapping[index],
+                                        self.ws.gpu_cache,
+                                        experts_cache,
                                         router_logits,
                                         self.top_k,
                                         renormalize=True,
@@ -283,20 +254,16 @@ class MixtralDecoderLayer(nn.Module):
             attn_out = self.self_attn(positions, hidden_states, input_metadata)
             return attn_out
         elif input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
-            # assert not torch.isnan(hidden_states).any(), "nan in POSTATTN input"
             # Self Attention
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 input_metadata=input_metadata,
             )
-            # check no nan in output
-            # assert not torch.isnan(hidden_states).any(), "nan in POSTATTN outputs"
-            # print("postattn:", hidden_states[:2, :2])
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-            hidden_states = self.block_sparse_moe(self.layer_id, hidden_states)
+            hidden_states = self.block_sparse_moe(self.layer_id, hidden_states, input_metadata.experts_mapping)
 
         return hidden_states, residual
 
@@ -307,7 +274,6 @@ class MixtralModel(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        memory_pool: Optional[MemoryPool] = None,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -320,15 +286,13 @@ class MixtralModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.memory_pool = memory_pool
         # init only one MixtralMoE
         self.block_sparse_moe = MixtralMoE(
             num_layers = config.num_hidden_layers,
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            memory_pool=self.memory_pool)
+            intermediate_size=config.intermediate_size)
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(config, i, block_sparse_moe=self.block_sparse_moe, linear_method=linear_method)
             for i in range(config.num_hidden_layers)
@@ -351,9 +315,6 @@ class MixtralModel(nn.Module):
             cur_layers = range(len(self.layers))
         for i in cur_layers:
             layer = self.layers[i]
-            # input_metadata.step_layer = i
-            # torch.cuda.synchronize()
-            # start = time.time()
             if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
                 hidden_states, residual = layer(positions, hidden_states,
                                                 input_metadata,
@@ -366,8 +327,6 @@ class MixtralModel(nn.Module):
             elif input_metadata.decode_part == DecodePart.CPU_ATTN:
                 attn_out = layer(None, None, input_metadata, None)
                 return attn_out
-            # torch.cuda.synchronize()
-            # print(f"Layer {i} time: {time.time() - start}")
         if cur_layers[-1] != len(self.layers) - 1:
             return hidden_states, residual
         else:
@@ -381,13 +340,11 @@ class MixtralForCausalLMOff(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        memory_pool: Optional[MemoryPool] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.expert_pool = memory_pool
-        self.model = MixtralModel(config, linear_method, memory_pool)
+        self.model = MixtralModel(config, linear_method)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         # self.current_experts = []
@@ -420,45 +377,6 @@ class MixtralForCausalLMOff(nn.Module):
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head.weight, input_metadata
             )
-        
-    def prefetch_expert(self, experts: List[Tuple[int, int]]):
-        start_pos = (experts[0][0] * self.config.num_local_experts + experts[0][1]) % self.expert_pool.size
-        end_pos = start_pos + len(experts)
-        self.expert_pool.mem_data[start_pos:end_pos].copy_(self.model.block_sparse_moe.ws.data[experts[0][0], experts[0][1]:experts[0][1]+len(experts)], non_blocking=True)
-    
-    def relayed_prefetch_expert(self, experts: List[Tuple[int, int]], prefetch_stream, prefetch_event, wait_event):
-        wait_event.synchronize()
-        for i in range(len(experts)):
-            # copy to pin_mem first
-            self.experts_pin_buffer[i].copy_(self.model.block_sparse_moe.ws.data[experts[i][0], experts[i][1]])
-            buf_pos = (experts[i][0] * self.config.num_local_experts + experts[i][1]) % self.expert_pool.size
-            # copy to GPU
-            with torch.cuda.stream(prefetch_stream):
-                self.expert_pool.mem_data[buf_pos].copy_(self.experts_pin_buffer[i], non_blocking=True)
-        prefetch_event.record(prefetch_stream)
-    
-    def prefetch_experts_to_pin(self, layer_id, expert_id, partition_id, total_partition, wait_event):
-        wait_event.synchronize()
-        partition_size = self.expert_pool.mem_data.shape[1] // total_partition
-        start = partition_id * partition_size
-        end = min((partition_id + 1) * partition_size, self.expert_pool.mem_data.shape[1])
-        self.experts_pin_buffer[expert_id, start:end].copy_(self.model.block_sparse_moe.ws.data[layer_id, expert_id, start:end])
-    
-    def prefetch_experts_from_pin(self, layer_id, expert_id, partition_id, total_partition):
-        buf_pos = (layer_id * self.config.num_local_experts + expert_id) % self.expert_pool.size
-        partition_size = self.expert_pool.mem_data.shape[1] // total_partition
-        start = partition_id * partition_size
-        end = min((partition_id + 1) * partition_size, self.expert_pool.mem_data.shape[1])
-        self.expert_pool.mem_data[buf_pos, start:end].copy_(self.experts_pin_buffer[expert_id, start:end], non_blocking=True)
-
-    def evict_expert(self, experts: List[Tuple[int, int]]):
-        if not experts:
-            return
-        free_index = []
-        for layer_id, expert_id in experts:
-            index = self.model.block_sparse_moe.ws.mapping[layer_id, expert_id]
-            free_index.append(index)
-        self.expert_pool.free(torch.tensor(free_index, dtype=torch.int32, device="cuda"))
 
     def load_weights(self,
                      model_name_or_path: str,
@@ -539,13 +457,12 @@ class MixtralForCausalLMOff(nn.Module):
                         weight_loader = getattr(param, "weight_loader",
                                                 default_weight_loader)
                         weight_loader(param, loaded_weight)
-        
-        # self.model.block_sparse_moe.ws.data = self.model.block_sparse_moe.ws.data.pin_memory()
-        # init mapping
-        for layer_id in range(self.config.num_hidden_layers):
-            for expert_id in range(self.config.num_local_experts):
-                self.model.block_sparse_moe.ws.mapping[layer_id, expert_id] = (layer_id * self.config.num_local_experts + expert_id) % self.expert_pool.size
-        
-        self.experts_pin_buffer = torch.empty((self.config.num_local_experts, 3 * self.config.intermediate_size * self.config.hidden_size), dtype=torch.get_default_dtype(), device="cpu").pin_memory()
+    
+    def get_experts_mem(self):
+        return self.model.block_sparse_moe.ws.data
+    
+    def link_gpu_experts_cache(self, expert_pool):
+        set_weight_attrs(self.model.block_sparse_moe.ws, {"gpu_cache": expert_pool})
+    
 
 EntryClass = MixtralForCausalLMOff

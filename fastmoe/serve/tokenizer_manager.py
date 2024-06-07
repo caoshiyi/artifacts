@@ -14,7 +14,6 @@ from fastmoe.utils.hf_transformers_utils import (
 )
 from fastmoe.serve.io_struct import (
     BatchStrOut,
-    FlushCacheReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
     BatchTokenizedGenerateReqInput,
@@ -173,10 +172,6 @@ class TokenizerManager:
                 del self.rid_to_state[rid]
 
             yield output_list
-
-    async def flush_cache(self):
-        flush_cache_req = FlushCacheReq()
-        self.send_to_router.send_pyobj(flush_cache_req)
 
     async def create_handle_loop(self):
         self.to_create_loop = False

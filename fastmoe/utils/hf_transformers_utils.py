@@ -78,7 +78,7 @@ NUM_EXPERTS_KEYS = [
 ]
 
 TOPK_KEYS = [
-    "num_experts_per_token",
+    "num_experts_per_tok",
     "moe_top_k",
 ]
 

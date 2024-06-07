@@ -21,7 +21,7 @@ if __name__ == "__main__":
     
     questions = load_questions("./question.jsonl")
     prompts = []
-    for i in range(20):
+    for i in range(61):
         for question in questions:
                 prompts.append(question["turns"][0])
 
@@ -29,7 +29,7 @@ if __name__ == "__main__":
     warmup = requests.post(
         url + "/generate",
         json={
-            "text": prompts[:50],
+            "text": prompts[:80],
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": 2,
@@ -38,7 +38,7 @@ if __name__ == "__main__":
         },
     )
 
-    max_new_tokens = 2
+    max_new_tokens = 32
     start = time.time()
     response = requests.post(
         url + "/generate",
@@ -54,7 +54,12 @@ if __name__ == "__main__":
     end = time.time()
     # save the result, create the file if it doesn't exist
     print(response.json())
+    num_finished = 0
+    for req in response.json():
+         if req['meta_info']['completion_tokens'] == max_new_tokens:
+            num_finished += 1
+        
     print(f"Time: {end - start:.3f}s")
-    print(f"Throughput: {max_new_tokens*len(prompts) / (end - start):.3f} tokens/s")
+    print(f"Throughput: {max_new_tokens*num_finished / (end - start):.3f} tokens/s")
     with open("response.json", "w") as fout:
         json.dump(response.json(), fout)

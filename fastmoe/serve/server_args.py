@@ -14,6 +14,9 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     chat_template: Optional[str] = None
     trust_remote_code: bool = True
+    cpu_mem_bdw: Optional[float] = None
+    avg_prompt_len: Optional[int] = None
+    gen_len: Optional[int] = None
     mem_fraction_static: Optional[float] = None
     max_prefill_num_token: Optional[int] = None
     tp_size: int = 1
@@ -100,6 +103,24 @@ class ServerArgs:
             "--trust-remote-code",
             action="store_true",
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--cpu-mem-bdw",
+            type=float,
+            default=ServerArgs.cpu_mem_bdw,
+            help="The profiled cpu memory bandwidth.",
+        )
+        parser.add_argument(
+            "--avg-prompt-len",
+            type=int,
+            default=ServerArgs.avg_prompt_len,
+            help="Avg Prompt Length of the Batched Task.",
+        )
+        parser.add_argument(
+            "--gen-len",
+            type=int,
+            default=ServerArgs.gen_len,
+            help="Generation Length.",
         )
         parser.add_argument(
             "--mem-fraction-static",

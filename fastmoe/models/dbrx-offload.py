@@ -1,4 +1,6 @@
 # coding=utf-8
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/dbrx.py
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -7,7 +9,7 @@ import torch.nn as nn
 from tqdm import tqdm
 import time
 
-from fastmoe.serve.router.infer_batch import DecodePart
+from fastmoe.backend.task_meta import InputMetadata, DecodePart
 from fastmoe.layers.attention import Attention
 from fastmoe.layers.stacked_fused_moe import stack_fused_moe
 from fastmoe.layers.linear import (LinearMethodBase,
@@ -15,8 +17,6 @@ from fastmoe.layers.linear import (LinearMethodBase,
                                                StackedLinear,
                                                RowParallelLinear)
 from fastmoe.layers.logits_processor import LogitsProcessor
-from fastmoe.serve.router.model_runner import InputMetadata
-from fastmoe.backend.memory import MemoryPool
 from fastmoe.models.configs.dbrx import DbrxConfig
 
 
@@ -78,7 +78,6 @@ class DbrxExperts(nn.Module):
         self,
         config: DbrxConfig,
         params_dtype: Optional[torch.dtype] = None,
-        memory_pool: Optional[MemoryPool] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -107,14 +106,6 @@ class DbrxExperts(nn.Module):
                 "weight_loader": self.weight_loader,
             },
         )
-
-        # memory manager
-        set_weight_attrs(self.ws, {"mem": memory_pool})
-        # mapping from cpu mem to gpu mem (expert id -> indices)
-        # must use int64, since page size is large
-        indices = torch.empty((self.num_layers, self.num_total_experts), dtype=torch.int64, device="cuda")
-        indices.fill_(memory_pool.size)
-        set_weight_attrs(self.ws, {"mapping": indices}) 
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, layer_id: int):
@@ -145,14 +136,14 @@ class DbrxExperts(nn.Module):
             ).transpose(1, 2)
             param_data[layer_id, :, w2_offset:] = loaded_weight[:, :, shard].reshape(self.num_total_experts, -1)
 
-    def forward(self, index:int, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, index:int, hidden_states: torch.Tensor, experts_mapping: torch.Tensor) -> torch.Tensor:
         # num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(index, hidden_states)
         final_hidden_states = stack_fused_moe(hidden_states,
-                                                self.ws.mem.mem_data,
-                                                self.ws.mapping[index],
+                                                self.ws.gpu_cache,
+                                                experts_mapping,
                                                 router_logits,
                                                 self.top_k,
                                                 renormalize=True,
@@ -331,7 +322,7 @@ class DbrxBlock(nn.Module):
                 input_metadata=input_metadata,
                 residual=residual,
             )
-            hidden_states = self.ffn(self.layer_id, hidden_states)
+            hidden_states = self.ffn(self.layer_id, hidden_states, input_metadata.experts_mapping)
             hidden_states = hidden_states + residual
             return hidden_states
         elif input_metadata.decode_part == DecodePart.PREATTN:
@@ -358,15 +349,13 @@ class DbrxModel(nn.Module):
         self,
         config: DbrxConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        memory_pool: Optional[MemoryPool] = None,
     ):
         super().__init__()
         self.wte = VocabParallelEmbedding(
             config.vocab_size,
             config.d_model,
         )
-        self.memory_pool = memory_pool
-        self.dbrx_experts = DbrxExperts(config, memory_pool=memory_pool)
+        self.dbrx_experts = DbrxExperts(config)
         self.blocks = nn.ModuleList(
             [DbrxBlock(config, i, dbrx_experts=self.dbrx_experts, linear_method=linear_method) for i in range(config.n_layers)])
         self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
@@ -416,14 +405,12 @@ class DbrxForCausalLMOff(nn.Module):
         self,
         config: DbrxConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        memory_pool: Optional[MemoryPool] = None,
     ):
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.expert_pool = memory_pool
         self.unpadded_vocab_size = config.vocab_size
-        self.transformer = DbrxModel(config, linear_method, memory_pool)
+        self.transformer = DbrxModel(config, linear_method)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.d_model,
@@ -460,25 +447,6 @@ class DbrxForCausalLMOff(nn.Module):
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head.weight, input_metadata
             )
-    
-    def prefetch_expert(self, experts: List[Tuple[int, int]]):
-        start_pos = (experts[0][0] * self.config.ffn_config.moe_num_experts + experts[0][1]) % self.expert_pool.size
-        end_pos = start_pos + len(experts)
-        self.expert_pool.mem_data[start_pos:end_pos].copy_(self.transformer.dbrx_experts.ws.data[experts[0][0], experts[0][1]:experts[0][1]+len(experts)], non_blocking=True)
-    
-    def prefetch_experts_to_pin(self, layer_id, expert_id, partition_id, total_partition, wait_event):
-        wait_event.synchronize()
-        partition_size = self.expert_pool.mem_data.shape[1] // total_partition
-        start = partition_id * partition_size
-        end = min((partition_id + 1) * partition_size, self.expert_pool.mem_data.shape[1])
-        self.experts_pin_buffer[expert_id, start:end].copy_(self.transformer.dbrx_experts.ws.data[layer_id, expert_id, start:end])
-    
-    def prefetch_experts_from_pin(self, layer_id, expert_id, partition_id, total_partition):
-        buf_pos = (layer_id * self.config.ffn_config.moe_num_experts + expert_id) % self.expert_pool.size
-        partition_size = self.expert_pool.mem_data.shape[1] // total_partition
-        start = partition_id * partition_size
-        end = min((partition_id + 1) * partition_size, self.expert_pool.mem_data.shape[1])
-        self.expert_pool.mem_data[buf_pos, start:end].copy_(self.experts_pin_buffer[expert_id, start:end], non_blocking=True)
         
     def load_weights(self, 
                      model_name_or_path: str,
@@ -531,11 +499,11 @@ class DbrxForCausalLMOff(nn.Module):
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
-        
-        for layer_id in range(self.config.n_layers):
-            for expert_id in range(self.config.ffn_config.moe_num_experts):
-                self.transformer.dbrx_experts.ws.mapping[layer_id, expert_id] = (layer_id * self.config.ffn_config.moe_num_experts + expert_id) % self.expert_pool.size
-        
-        self.experts_pin_buffer = torch.empty((self.config.ffn_config.moe_num_experts, 3 * self.config.ffn_config.ffn_hidden_size * self.config.d_model), dtype=torch.get_default_dtype(), device="cpu").pin_memory()
+    
+    def get_experts_mem(self):
+        return self.transformer.dbrx_experts.ws.data
+    
+    def link_gpu_experts_cache(self, expert_pool):
+        set_weight_attrs(self.transformer.dbrx_experts.ws, {"gpu_cache": expert_pool})
 
 EntryClass = DbrxForCausalLMOff

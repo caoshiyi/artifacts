@@ -1,0 +1,72 @@
+# Dataset: MTBench 
+
+########### CONFIG FROM PROFILING ############
+# python3 fit_cost_model_moe.py 
+class CostModelConfig:
+    s: int = 512
+    n: int = 32
+
+    l: int = 32
+    h1: int = 4096
+    h2: int = 4096 * 4
+    nh: int = 32
+    nkvh: int = 8
+
+    n_experts: int = 8
+
+    # 15 * 204??
+    gmem: int = 16 * GB
+    cmem: int = 192 * GB
+    nmem: int = 0 * GB
+    
+    ctog_bdw: float = 5.4299 * GB
+    gtoc_bdw_cache: float = 2.0151 * GB
+    gtoc_bdw_hidden: float = 2.0151 * GB
+
+    dtoc_bdw: float = 2.0151 * GB
+    ctod_bdw_cache_p: float = 2.0151 * GB
+    ctod_bdw_hidden_p: float = 2.0151 * GB
+    ctod_bdw_g: float = 2.0151 * GB
+
+    mm_flops_p: float = 3.5068 * T
+    mm_flops_g: float = 1.4755 * T
+    bmm_flops_p: float = 1.3360 * T
+    bmm_flops_g: float = 0.9318 * T
+    cpu_flops: float = 4.4999 * T
+    
+    c1: float = 0.0000
+    c2: float = 0.0070 # 
+    c3: float = 0.0000
+
+
+############# RESULTS ###############
+# 1. GEN LEN = 32 
+# python3 cost_model_moe_t4.py --gpu-mem 16 --cpu-mem 192 --nvme-mem 0 --prompt-len 418 --gen-len 32
+
+## Best Policy 
+Policy(gpu_batch_size=32, num_gpu_batches=40, w_gpu_percent=0.070076977, w_cpu_percent=0.92992302, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 13.33 token/s
+
+
+# 2. GEN LEN = 64
+# python3 cost_model_moe_t4.py --gpu-mem 16 --cpu-mem 192 --nvme-mem 0 --prompt-len 418 --gen-len 64
+
+## Best Policy 
+Policy(gpu_batch_size=16, num_gpu_batches=78, w_gpu_percent=0.080626157, w_cpu_percent=0.91937384, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 20.61 token/s
+
+
+
+# 3. GEN LEN = 128 
+# python3 cost_model_moe_t4.py --gpu-mem 16 --cpu-mem 192 --nvme-mem 0 --prompt-len 418 --gen-len 128
+
+## Best Policy 
+Policy(gpu_batch_size=8, num_gpu_batches=139, w_gpu_percent=0.085900747, w_cpu_percent=0.91409925, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 27.40 token/s
+
+# 4. GEN LEN = 256 
+# python3 cost_model_moe_t4.py --gpu-mem 16 --cpu-mem 192 --nvme-mem 0 --prompt-len 418 --gen-len 256
+
+## Best Policy 
+Policy(gpu_batch_size=8, num_gpu_batches=113, w_gpu_percent=0.085900747, w_cpu_percent=0.91409925, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 30.59 token/s
