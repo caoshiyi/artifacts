@@ -1,0 +1,2 @@
+python3 helm_run_moe.py --description synthetic_reasoning:model=text,mode=pattern_match --percent 14 86 0 100 0 100 --gpu-batch-size 1 --num-gpu-batches 5 --cpu-cache-compute
+python3 helm_run_moe.py --description gsm:model=text_code --percent 14 86 0 100 0 100 --gpu-batch-size 1 --num-gpu-batches 5 --cpu-cache-compute

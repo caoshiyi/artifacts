@@ -13,18 +13,16 @@ import json
 import math
 import os
 import time
-from flexgen.flex_moe import (Policy, MixtralLM, ExecutionEnv, CompressionConfig,
-        str2bool, model_bytes, cache_bytes, hidden_bytes)
-from flexgen.moe_pytorch_backend import (TorchDevice, TorchDisk, TorchMixedDevice)
-from typing import Optional, List
-import json 
-from flexgen.timer import timers
-from flexgen.utils import GB 
 
+from flexgen.flex_opt import (Policy, OptLM, ExecutionEnv, CompressionConfig,
+        str2bool)
 from helm.benchmark.presentation.run_entry import RunEntry
 from helm.benchmark.run import run_entries_to_run_specs
+from helm.benchmark.run_specs import (ScenarioSpec, RunSpec, get_summarization_adapter_spec,
+    get_summarization_metric_specs, get_generative_harms_metric_specs,
+    ADAPT_MULTIPLE_CHOICE_JOINT, get_multiple_choice_adapter_spec)
 from helm.benchmark.runner import (create_scenario, AdapterFactory, with_instance_ids, create_metric,
-    TokensMetric, MetricResult, PerInstanceStats, create_metric, Stat,
+    TokensMetric, Metric, MetricSpec, MetricResult, PerInstanceStats, create_metric, Stat,
     ScenarioState, Counter, MetricName, ensure_directory_exists, write, asdict_without_nones,
     DataPreprocessor)
 from helm.common.request import Request, RequestResult, Sequence, Token
@@ -42,10 +40,6 @@ class OptTokenizer:
     def __init__(self, name):
         self.tokenizer = AutoTokenizer.from_pretrained(name, padding_side="left")
         self.tokenizer.add_bos_token = False
-        
-        # TODO: adapt from mtbench run?
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        
         if 'galactica' in name:
             config = AutoConfig.from_pretrained(name)
             self.tokenizer.pad_token = config.pad_token_id
@@ -110,6 +104,8 @@ def get_hf_generation_args(request, tokenizer):
         "top_k_per_token": request.top_k_per_token,
         "stop_sequences": request.stop_sequences,
     }
+    print(f"Request max token: {request.max_tokens}")
+    print(f"Request stop sequences: {request.stop_sequences}")
 
     raw_request["do_sample"] = True
     raw_request["return_dict_in_generate"] = True
@@ -119,10 +115,11 @@ def get_hf_generation_args(request, tokenizer):
 
     if len(raw_request["stop_sequences"]) > 0:
         stop_sequence_ids = tokenizer(raw_request["stop_sequences"])
+        print(f"stop_sequence_ids: {stop_sequence_ids}")
         # Total number of stop words should be 1.
         assert len(stop_sequence_ids.input_ids) == 1
         # Total number of tokens in each stop word should be 1.
-        assert len(stop_sequence_ids.input_ids[0]) == 1
+        assert len(stop_sequence_ids.input_ids[0]) == 1, f"stop_sequence_ids: {len(stop_sequence_ids.input_ids[0])}"
         del raw_request["stop_sequences"]
         raw_request["eos_token_id"] = stop_sequence_ids.input_ids[0][0]
 
@@ -139,13 +136,10 @@ def get_hf_generation_args(request, tokenizer):
 
 def get_batches(scenario_state, tokenizer, batch_size, pad_to_seq_len):
     prompts = []
-    # NOTE: manual repeating the prompts 
-    for i in range(6):
-        for r in scenario_state.request_states:
-            prompts.append(r.request.prompt)
+    for r in scenario_state.request_states:
+        prompts.append(r.request.prompt)
 
     # Tokenize
-    print(f"Number of propmts: {len(prompts)}")
     input_ids = tokenizer(prompts, padding="max_length",
                           return_tensors="np",
                           max_length=pad_to_seq_len).input_ids
@@ -161,32 +155,20 @@ def get_batches(scenario_state, tokenizer, batch_size, pad_to_seq_len):
 
     print(f"Max sequence length: {max_seq_len}, Pad to sequences length: {pad_to_seq_len}")
 
-    # Just take n_prompts = batch_size, run one effective batch size 
-    n_prompts = batch_size 
-    input_ids = input_ids[:n_prompts]
-    
-    print(f"Shrink to size: {n_prompts}")
-    return [{"input_ids": input_ids}]
-
     # Pad and divide into batches
-    # n_prompts = len(prompts)
-    # if n_prompts % batch_size != 0:
-    #     input_ids = np.concatenate((input_ids, np.full((batch_size - n_prompts % batch_size,
-    #         input_ids.shape[1]), tokenizer.pad_token_id, dtype=input_ids.dtype)))
+    n_prompts = len(prompts)
+    print(f"Number of prompts: {n_prompts}")
+    if n_prompts % batch_size != 0:
+        input_ids = np.concatenate((input_ids, np.full((batch_size - n_prompts % batch_size,
+            input_ids.shape[1]), tokenizer.pad_token_id, dtype=input_ids.dtype)))
 
-    # num_batches = len(input_ids) // batch_size
-    # assert len(input_ids) % batch_size == 0
-    # return [
-    #     {"input_ids": input_ids[i * batch_size: (i+1) * batch_size]}
-    #     for i in range(num_batches)
-    # ]
+    num_batches = len(input_ids) // batch_size
+    assert len(input_ids) % batch_size == 0
+    return [
+        {"input_ids": input_ids[i * batch_size: (i+1) * batch_size]}
+        for i in range(num_batches)
+    ]
 
-
-def get_config(model: str, trust_remote_code: bool = True, revision: Optional[str] = None):
-    config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision
-    )
-    return config
 
 def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
     generation_args = get_hf_generation_args(
@@ -194,22 +176,15 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
     batches = get_batches(scenario_state, tokenizer,
                           effective_bs, pad_to_seq_len=pad_to_seq_len)
 
-    # NOTE: only run one effective batch 
-    print(f"Number of batches: {len(batches)}")
-    assert len(batches) == 1
-    
     # Initialize environment
-    gpu = TorchDevice("cuda:0")
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    env = ExecutionEnv.create(args.offload_dir)
 
     # Offloading policy
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1],
                     args.percent[2], args.percent[3],
                     args.percent[4], args.percent[5],
-                    overlap=True, sep_layer=True, pin_weight=False,
+                    overlap=True, sep_layer=True, pin_weight=args.pin_weight,
                     cpu_cache_compute=args.cpu_cache_compute, attn_sparsity=1.0,
                     compress_weight=args.compress_weight,
                     comp_weight_config=CompressionConfig(
@@ -219,55 +194,29 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
                     comp_cache_config=CompressionConfig(
                         num_bits=4, group_size=64,
                         group_dim=2, symmetric=False))
-    assert not (args.compress_cache), "Not implemented"
-    
-    mixtral_config = get_config(args.model)
-    mixtral_config.pad_token_id = tokenizer.pad_token_id
-    
+
     print(f"Init weights begin.")
     tic = time.time()
-    model = MixtralLM(args.model, mixtral_config, env, args.path, policy)
+    model = OptLM(args.model, env, args.path, policy)
     print(f"Init weights end. Elapsed: {time.time() - tic:.2f} s", flush=True)
 
     # Generate
-    print(f"Generate begin. #sequences: {len(batches)} * {effective_bs} =  {len(batches) * effective_bs}")
+    print(f"Generate begin. #sequences: {len(batches) * effective_bs}")
     tic = time.time()
     input_ids_batches = []
     output_ids_batches = []
-    
     for batch in tqdm(batches):
         input_ids_tmp = batch["input_ids"]
-        timers("generate").reset()
         output_ids_tmp = model.generate(
             input_ids_tmp,
-            # do_sample=generation_args["do_sample"],
-            temperature=0,
-            max_new_tokens=args.gen_len,
-            # max_new_tokens=generation_args["max_new_tokens"],
-            # stop=generation_args.get("eos_token_id", None)
-            )
-        costs = timers("generate").costs
+            do_sample=generation_args["do_sample"],
+            temperature=generation_args["temperature"],
+            max_new_tokens=generation_args["max_new_tokens"],
+            stop=generation_args.get("eos_token_id", None))
         input_ids_batches.append(input_ids_tmp)
         output_ids_batches.append(output_ids_tmp)
     print(f"Generate end. Elapsed: {time.time() - tic:.2f} s", flush=True)
 
-    num_prompts = effective_bs 
-    prompt_len = pad_to_seq_len
-    gen_len = args.gen_len 
-    cache_size = cache_bytes(mixtral_config, num_prompts, prompt_len + gen_len)
-    hidden_size = hidden_bytes(mixtral_config, num_prompts, prompt_len + gen_len)
-    
-    prefill_latency = costs[0]
-    prefill_throughput = num_prompts * prompt_len / prefill_latency
-    decode_latency = sum(costs[1:])
-    decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-    num_generated_tokens = num_prompts * gen_len
-    total_latency = prefill_latency + decode_latency
-    total_throughput = num_generated_tokens / total_latency
-    _, gpu_peak_mem = gpu.mem_stats()
-    _, cpu_peak_mem = cpu.mem_stats()
-    
-    
     input_ids = np.concatenate(input_ids_batches)
     output_ids = np.concatenate(output_ids_batches)
     outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
@@ -276,22 +225,7 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
     #for i in [0, len(outputs) - 1]:
     #    print(f"{i}:\n{outputs[i]}")
     #    print("-" * 70)
-    
-    gpu.print_stats()
-    cpu.print_stats()
-    log_str = (f"model size: {model_bytes(mixtral_config)/GB:.3f} GB\t"
-            f"cache size: {cache_size/GB:.3f} GB\t"
-            f"hidden size (p): {hidden_size/GB:.3f} GB\n"
-            f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
-            f"prefill latency: {prefill_latency:.3f} s\t"
-            f"prefill throughput: {prefill_throughput:.3f} token/s\n"
-            f"decode latency: {decode_latency:.3f} s\t"
-            f"decode throughput: {decode_throughput:.3f} token/s\n"
-            f"total latency: {total_latency:.3f} s\t"
-            f"total throughput: {total_throughput:.3f} token/s")
-        
-    print(log_str)
-    
+
     # Shutdown
     print("Shutdown...")
     env.close_copy_threads()
@@ -364,7 +298,7 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
 
 def run_entry(description, pad_to_seq_len, args):
     effective_bs = args.gpu_batch_size * args.num_gpu_batches
-    parallelism = 4
+    parallelism = 1
 
     ##### RunSpec #####
     run_entries = [RunEntry(description, priority=1, groups=None)]
@@ -461,9 +395,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--description", type=str, required=True)
-    parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--pad-to-seq-len", type=int)
-    parser.add_argument("--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1",
+    parser.add_argument("--model", type=str, default="facebook/opt-1.3b",
         help="The model name.")
     parser.add_argument("--path", type=str, default="~/opt_weights",
         help="The path to the model weights. If there are no cached weights, "

@@ -1,0 +1,32 @@
+--> synthetic_reasoning:model=together/opt-175b,mode=pattern_match
+* gen_len = 50 
+* prompt_len = 256 (max)
+
+* Generate policy 
+- python3 cost_model_moe_t4.py --gpu-mem 16 --cpu-mem 192 --nvme-mem 0 --prompt-len 256 --gen-len 50 
+- result 
+
+Policy(gpu_batch_size=32, num_gpu_batches=61, w_gpu_percent=0.079229287, w_cpu_percent=0.92077071, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 26.44 token/s
+
+--> summarization_xsum_sampled:model=text,temperature=0.3,device=cpu
+* gen_len = 64 
+* prompt_len = 1984 (max)
+
+* Generate policy 
+- python3 cost_model_moe_t4.py --gpu-mem 16 --cpu-mem 192 --nvme-mem 0 --prompt-len 1984 --gen-len 64 
+- result 
+
+Policy(gpu_batch_size=3, num_gpu_batches=92, w_gpu_percent=0.074936175, w_cpu_percent=0.92506382, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 4.67 token/s
+
+--> gsm:model=text_code
+* gen_len = 400 
+* prompt_len = 1536 (max)
+
+* Generate policy 
+- python3 cost_model_moe_t4.py --gpu-mem 16 --cpu-mem 192 --nvme-mem 0 --prompt-len 1536 --gen-len 400
+- result 
+
+Policy(gpu_batch_size=1, num_gpu_batches=315, w_gpu_percent=0.087490366, w_cpu_percent=0.91250963, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 13.44 token/s
