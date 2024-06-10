@@ -90,7 +90,7 @@ if __name__ == "__main__":
         # "babi_qa:model=text_code,task=1",
         # "entity_data_imputation:model=text,dataset=Buy",
         ## FAIL!
-        # "boolq:model=text,only_contrast=True,data_augmentation=contrast_sets",
+        "boolq:model=text,only_contrast=True,data_augmentation=contrast_sets",
         # "copyright:model=text,datatag=n_books_1000-extractions_per_book_1-prefix_length_125",
         # "gsm:model=text_code",
         # "synthetic_reasoning:model=text_code,mode=pattern_match", # Fails, prompt_len = 249 (pad to 256), gen_len = 50, num_req = 30 
@@ -100,7 +100,7 @@ if __name__ == "__main__":
         # "lextreme:subset=brazilian_court_decisions_judgment,model=all"
     ]
     
-    gets = passed
+    # gets = passed
 
     descriptions = [
         # 1 need to download the dataset manually.

@@ -1,1 +1,0 @@
-python3 helm_run_8x7b_moe.py --description synthetic_reasoning:model=together/opt-175b,mode=pattern_match --pad-to-seq-len 256 --gen-len 32 --percent 0 100 0 100 0 100 --gpu-batch-size 1 --num-gpu-batches 5 --cpu-cache-compute

@@ -36,15 +36,18 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoConfig
 
 
+
+    
+
 class OptTokenizer:
     # Adapted from helm/proxy/clients/huggingface_client.py
 
     def __init__(self, name):
         self.tokenizer = AutoTokenizer.from_pretrained(name, padding_side="left")
         self.tokenizer.add_bos_token = False
-        
-        # TODO: adapt from mtbench run? shall we add this or not?
-        # self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # NOTE: adapt from MTBench run 
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         
         if 'galactica' in name:
             config = AutoConfig.from_pretrained(name)
@@ -116,15 +119,18 @@ def get_hf_generation_args(request, tokenizer):
     raw_request["output_scores"] = True
     top_k_per_token: int = raw_request["top_k_per_token"]
     del raw_request["top_k_per_token"]
-
+    
     if len(raw_request["stop_sequences"]) > 0:
         stop_sequence_ids = tokenizer(raw_request["stop_sequences"])
         # Total number of stop words should be 1.
         assert len(stop_sequence_ids.input_ids) == 1
-        # Total number of tokens in each stop word should be 1.
-        assert len(stop_sequence_ids.input_ids[0]) == 1
+        
+        # NOTE: remove this - Total number of tokens in each stop word should be 1.
+        # assert len(stop_sequence_ids.input_ids[0]) == 1, f"Input ids: {stop_sequence_ids.input_ids[0]}, length: {len(stop_sequence_ids.input_ids[0])}"
         del raw_request["stop_sequences"]
-        raw_request["eos_token_id"] = stop_sequence_ids.input_ids[0][0]
+        
+        if len(stop_sequence_ids.input_ids[0]) == 1:
+            raw_request["eos_token_id"] = stop_sequence_ids.input_ids[0][0]
 
     # Strip out irrelevant parameters
     relevant_raw_request = {
@@ -139,10 +145,13 @@ def get_hf_generation_args(request, tokenizer):
 
 def get_batches(scenario_state, tokenizer, batch_size, pad_to_seq_len):
     prompts = []
-    # NOTE: manual repeating the prompts 
-    for i in range(6):
+    # NOTE: manual repeating the prompts until around 3000 or so 
+    while len(prompts) < 3000:
         for r in scenario_state.request_states:
             prompts.append(r.request.prompt)
+            
+            if len(prompts) >= 3000:
+                break
 
     # Tokenize
     print(f"Number of propmts: {len(prompts)}")
@@ -159,27 +168,14 @@ def get_batches(scenario_state, tokenizer, batch_size, pad_to_seq_len):
         assert len(input_ids.shape) == 2, f"Auto-adjusting pad_to_seq_len failed. current = {pad_to_seq_len}"
         max_seq_len = max(np.sum(input_ids != tokenizer.pad_token_id, axis=1))
 
-    print(f"Max sequence length: {max_seq_len}, Pad to sequences length: {pad_to_seq_len}")
+    print(f"\nREAL (ULTIMATE): Max sequence length: {max_seq_len}, Pad to sequences length: {pad_to_seq_len}")
 
     # Just take n_prompts = batch_size, run one effective batch size 
     n_prompts = batch_size 
     input_ids = input_ids[:n_prompts]
     
-    print(f"Shrink to size: {n_prompts}")
+    print(f"REAL (ULTIMATE): Running # of requests = {n_prompts}")
     return [{"input_ids": input_ids}]
-
-    # Pad and divide into batches
-    # n_prompts = len(prompts)
-    # if n_prompts % batch_size != 0:
-    #     input_ids = np.concatenate((input_ids, np.full((batch_size - n_prompts % batch_size,
-    #         input_ids.shape[1]), tokenizer.pad_token_id, dtype=input_ids.dtype)))
-
-    # num_batches = len(input_ids) // batch_size
-    # assert len(input_ids) % batch_size == 0
-    # return [
-    #     {"input_ids": input_ids[i * batch_size: (i+1) * batch_size]}
-    #     for i in range(num_batches)
-    # ]
 
 
 def get_config(model: str, trust_remote_code: bool = True, revision: Optional[str] = None):
@@ -195,9 +191,8 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
                           effective_bs, pad_to_seq_len=pad_to_seq_len)
 
     # NOTE: only run one effective batch 
-    print(f"Number of batches: {len(batches)}")
     assert len(batches) == 1
-    
+    print(f"REAL (ULTIMATE): max generation tokens = {generation_args['max_new_tokens']}\n")
     # Initialize environment
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -234,6 +229,8 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
     tic = time.time()
     input_ids_batches = []
     output_ids_batches = []
+
+    print(f"Setting: do_sample: {generation_args['do_sample']}, temperature: {generation_args['temperature']}, max_new_tokens: {generation_args['max_new_tokens']}")
     
     for batch in tqdm(batches):
         input_ids_tmp = batch["input_ids"]
@@ -241,11 +238,10 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
         output_ids_tmp = model.generate(
             input_ids_tmp,
             do_sample=generation_args["do_sample"],
-            temperature=0,
-            max_new_tokens=args.gen_len,
-            # max_new_tokens=generation_args["max_new_tokens"],
-            stop=generation_args.get("eos_token_id", None)
-            )
+            temperature=generation_args["temperature"],
+            max_new_tokens=generation_args["max_new_tokens"],
+            # stop=generation_args.get("eos_token_id", None), # NOTE: disable eos_token_id
+        )
         costs = timers("generate").costs
         input_ids_batches.append(input_ids_tmp)
         output_ids_batches.append(output_ids_tmp)
@@ -253,7 +249,7 @@ def execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len):
 
     num_prompts = effective_bs 
     prompt_len = pad_to_seq_len
-    gen_len = args.gen_len 
+    gen_len = generation_args["max_new_tokens"]
     cache_size = cache_bytes(mixtral_config, num_prompts, prompt_len + gen_len)
     hidden_size = hidden_bytes(mixtral_config, num_prompts, prompt_len + gen_len)
     
@@ -407,6 +403,9 @@ def run_entry(description, pad_to_seq_len, args):
     ##### Execute #####
     if pad_to_seq_len is None:
         pad_to_seq_len = adapter.window_service.max_sequence_length - run_spec.adapter_spec.max_tokens + 1
+        print(f"Assign pad_to_seq_len = {pad_to_seq_len}")
+    else:
+        print(f"Use pad_to_seq_len = {pad_to_seq_len}")
     scenario_state = execute(scenario_state, tokenizer, effective_bs, pad_to_seq_len)
 
     ##### Metrics #####
@@ -461,7 +460,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--description", type=str, required=True)
-    parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--pad-to-seq-len", type=int)
     parser.add_argument("--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1",
         help="The model name.")
