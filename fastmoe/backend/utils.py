@@ -40,10 +40,21 @@ class HardwareConfig:
                 gmem=24 * GB,
                 cmem=cpu_mem * GB,
                 ctog_bdw=16 * GB,
-                g_bdw=300 * GB,
+                g_bdw=285 * GB,
                 c_bdw=c_bdw * GB,
                 gpu_flops=104 * T,
-                cpu_flops=13 * T,
+                cpu_flops=1.6 * T,
+                tp_size=tp_size
+            )
+        elif "T4" in gpu_device_name:
+            return cls(
+                gmem=15 * GB,
+                cmem=cpu_mem * GB,
+                ctog_bdw=16 * GB,
+                g_bdw=300 * GB,
+                c_bdw=c_bdw * GB,
+                gpu_flops=65 * T,
+                cpu_flops=0.8 * T,
                 tp_size=tp_size
             )
         else:

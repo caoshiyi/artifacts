@@ -301,7 +301,7 @@ def stack_fused_moe(
     intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
-    intermediate_cache2 = torch.zeros((M * topk_ids.shape[1], N // 2),
+    intermediate_cache2 = torch.empty((M * topk_ids.shape[1], N // 2),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
     intermediate_cache3 = torch.empty((M, topk_ids.shape[1], H),
@@ -340,12 +340,14 @@ def stack_fused_moe(
 #     dtype: torch.dtype,
 # ):
 #     a = torch.ones((m, k), device='cuda', dtype=dtype)
-#     w1 = torch.ones((4*e, 3 * n * k), device='cuda', dtype=dtype)
+#     w1 = torch.ones((2*e, 3 * n * k), device='cuda', dtype=dtype)
 #     # must use int64, since page size is large
-#     indices = torch.tensor([0,4,8,12,16,20,24,28], dtype=torch.int64, device='cuda')
+#     indices = torch.tensor([0,2,3,6,8,10,12,14], dtype=torch.int64, device='cuda')
 
 #     score = torch.randn((m, e), device='cuda', dtype=dtype)
 #     triton_output = stack_fused_moe(a, w1, indices, score, topk, renormalize=True, inplace=True)
 #     return triton_output
 
-# test_fused_moe(40000, 14336, 4096, 8, 2, torch.float16)
+# test_fused_moe(2000, 14336, 4096, 8, 2, torch.float16)
+# for i in range(2):
+#     test_fused_moe(2000, 14336, 4096, 8, 2, torch.float16)

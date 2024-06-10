@@ -115,8 +115,13 @@ class TokenizerManager:
             assert obj.stream is False
             if obj.batch:
                 # in this mode, we assume the batch share the same sampling_params
+                max_padding_length = obj.max_padding_length
+                self.tokenizer.pad_token = self.tokenizer.eos_token
                 rid = obj.rid
-                input_ids = self.tokenizer(obj.text).input_ids
+                if max_padding_length == 0:
+                    input_ids = self.tokenizer(obj.text).input_ids
+                else:
+                    input_ids = self.tokenizer(obj.text, padding="max_length", max_length=max_padding_length).input_ids
                 sampling_params = SamplingParams(**obj.sampling_params[0])
                 if sampling_params.max_new_tokens != 0:
                         sampling_params.normalize(self.tokenizer)

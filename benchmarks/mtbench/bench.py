@@ -21,7 +21,7 @@ if __name__ == "__main__":
     
     questions = load_questions("./question.jsonl")
     prompts = []
-    for i in range(61):
+    for i in range(59):
         for question in questions:
                 prompts.append(question["turns"][0])
 
@@ -29,16 +29,19 @@ if __name__ == "__main__":
     warmup = requests.post(
         url + "/generate",
         json={
-            "text": prompts[:80],
+            "text": prompts[:50],
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": 2,
             },
             "batch": True,
+            "max_padding_length": 0,
         },
     )
+    print(warmup.json())
 
     max_new_tokens = 32
+    max_padding_length = 0
     start = time.time()
     response = requests.post(
         url + "/generate",
@@ -49,6 +52,7 @@ if __name__ == "__main__":
                 "max_new_tokens": max_new_tokens,
             },
             "batch": True,
+            "max_padding_length": max_padding_length,
         },
     )
     end = time.time()
@@ -61,5 +65,8 @@ if __name__ == "__main__":
         
     print(f"Time: {end - start:.3f}s")
     print(f"Throughput: {max_new_tokens*num_finished / (end - start):.3f} tokens/s")
-    with open("response.json", "w") as fout:
-        json.dump(response.json(), fout)
+    results = {"time": end - start, "throughput": max_new_tokens*num_finished / (end - start), "max_new_tokens": max_new_tokens, "max_padding_length": max_padding_length}
+    # write the results to a file, create the file if it doesn't exist, write to the end if it does
+    with open("mtbench_moel_L4.jsonl", "a") as fout:
+        fout.write(json.dumps(results) + "\n")
+    

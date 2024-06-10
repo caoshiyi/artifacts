@@ -20,6 +20,7 @@ class GenerateReqInput:
     # Whether to stream output
     stream: bool = False
     batch: bool = False
+    max_padding_length: int = 0
 
     def post_init(self):
         is_single = isinstance(self.text, str)

@@ -257,6 +257,7 @@ class ExecutionEngine:
                 if self.micro_batches[batch_id].hidden_states_cpu is None:
                     self.micro_batches[batch_id].hidden_states_cpu = torch.empty_like(self.micro_batches[batch_id].hidden_states, device="cpu").pin_memory()
                 self.micro_batches[batch_id].hidden_states_cpu.copy_(self.micro_batches[batch_id].hidden_states, non_blocking=True)
+                self.micro_batches[batch_id].hidden_states = None
 
     # read: weights, write: kvcache, 
     def layer(self, layer_id: int, page_id: int, batch_id: int):
@@ -485,8 +486,8 @@ class ExecutionContext:
         policy, _ = solve(model_config, hardware_config, opt_args)
         print(f"Policy: {policy}")
         # # hack
-        # policy.ubs = 80
-        # policy.n_ub = 4
+        # policy.ubs = 55
+        # policy.n_ub = 5
         
         # allocate mem for the context
         ubs = policy.ubs
