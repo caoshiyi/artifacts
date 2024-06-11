@@ -16,14 +16,14 @@ def plot_e2e_single(dataset, model, device):
             'FlexGen': [29.15, 34.94, 37.18, 28.82],
             'FlexGen(c)': [17.50, 18.92, 20.00, 15.87],
             'MoE-Lightning(p)': [53.71, 67.37, 78.97, 78.6],
-            'MoE-Lightning': [203.69, 289.02, 285.96, 181.60]
+            'MoE-Lightning': [203.00, 294.54, 217.54, 167.9]
         }
     elif device == "T4":
         throughputs = {
             'FlexGen': [12.14, 12.32, 9.50, 9.63],
             'FlexGen(c)': [9.81, 9.363, 7.164, 6.782],
-            'MoE-Lightning(p)': [53.71, 67.37, 78.97, 78.6],
-            'MoE-Lightning': [63.04, 101.33, 100.89, 181.60]
+            'MoE-Lightning(p)': [15.61, 24, 30.12, 33.94],
+            'MoE-Lightning': [63.04, 101.33, 108.62, 96.7]
         }
 
     x = np.arange(len(generation_lengths))  # the label locations
@@ -53,7 +53,7 @@ def plot_e2e_single(dataset, model, device):
             if label == 'MoE-Lightning(p)':
                 speedup = height / max_non_moe_throughput[j]
                 ax.annotate(f'{speedup:.1f}x',
-                            xy=(rect.get_x() + rect.get_width() / 2, height + 10),
+                            xy=(rect.get_x() + rect.get_width() / 2, height+4),
                             xytext=(0, 3),  # 3 points vertical offset
                             textcoords="offset points",
                             ha='center', va='bottom', 
