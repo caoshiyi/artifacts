@@ -5,19 +5,11 @@ import requests
 import time
 from helm.benchmark.presentation.run_entry import RunEntry
 from helm.benchmark.run import run_entries_to_run_specs
-from helm.benchmark.run_specs import (ScenarioSpec, RunSpec, get_summarization_adapter_spec,
-    get_summarization_metric_specs, get_generative_harms_metric_specs,
-    ADAPT_MULTIPLE_CHOICE_JOINT, get_multiple_choice_adapter_spec)
-from helm.benchmark.runner import (create_scenario, AdapterFactory, with_instance_ids, create_metric,
-    TokensMetric, Metric, MetricSpec, MetricResult, PerInstanceStats, create_metric, Stat,
-    ScenarioState, Counter, MetricName, ensure_directory_exists, write, asdict_without_nones,
-    DataPreprocessor)
-from helm.common.request import Request, RequestResult, Sequence, Token
+from helm.benchmark.runner import (create_scenario, AdapterFactory, with_instance_ids, DataPreprocessor)
 from helm.common.tokenization_request import (TokenizationRequestResult,
     TokenizationRequest, TokenizationToken, DecodeRequest, DecodeRequestResult)
-from helm.proxy.clients.client import truncate_sequence
 
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer
 # pip install lightning==2.0.1 crfm-helm==0.2.1 transformers==4.41.2
 
 class MixtralTokenizer:
@@ -181,5 +173,5 @@ if __name__ == "__main__":
     print(f"Throughput: {max_new_tokens*num_finished / (end - start):.3f} tokens/s")
     results = {"time": end - start, "throughput": max_new_tokens*num_finished / (end - start), "max_new_tokens": max_new_tokens, "max_padding_length": max_padding_length}
     # write the results to a file, create the file if it doesn't exist, write to the end if it does
-    with open("mtbench_moel_L4.jsonl", "a") as fout:
+    with open("helm2_moel_L4.jsonl", "a") as fout:
         fout.write(json.dumps(results) + "\n")

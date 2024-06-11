@@ -486,8 +486,8 @@ class ExecutionContext:
         policy, _ = solve(model_config, hardware_config, opt_args)
         print(f"Policy: {policy}")
         # # hack
-        # policy.ubs = 55
-        # policy.n_ub = 5
+        # policy.ubs = 8
+        # policy.n_ub = 36
         
         # allocate mem for the context
         ubs = policy.ubs

@@ -142,7 +142,7 @@ def solve_lp(config, bls, gbs, verbose=1, stage="decode"):
     prob += gpu_home_d == w_other + wi * l * wg + 2 * 2 * h1 * bls + 4 * (s + n) * h_kv * bls * l * (cg + cc * gattn)
     # weights + gpu_experts + kv_cache_gpu + hidden_states_buffer (2gbs:hidden+residual) + kvcahe buffer (2gbs)
     # L4+padding
-    # prob += gpu_home_p == w_other + wi * l * wg + 4 * s * h_kv * bls * cg + 2 * h1 * gbs * 2 * s + h1 * bls * 2 * s + 4 * s * h_kv * gbs * 2 * cc
+    # prob += gpu_home_p == w_other + wi * l * wg + 4 * s * h_kv * bls * cg + 2 * 2 * h1 * gbs * 2 * s + 4 * s * h_kv * gbs * 2 * cc
     # t4 (currently residual is not offloaded to cpu, so it is included in the peak memory to avoid OOM for T4)
     prob += gpu_home_p == w_other + wi * l * wg + 4 * s * h_kv * bls * cg + 2 * h1 * gbs * 2 * s + h1 * bls * 2 * s + 4 * s * h_kv * gbs * 2 * cc
 
