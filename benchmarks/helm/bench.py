@@ -119,7 +119,7 @@ def get_requests(description, args):
 
     # Data preprocessing
     instances = DataPreprocessor(run_spec.data_augmenter_spec).preprocess(
-        instances, parallelism=1
+        instances, parallelism=2
     )
     scenario_state = adapter.adapt(instances, parallelism=1)
     
@@ -130,7 +130,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--description", type=str, required=True)
     parser.add_argument("--pad-len", type=int, default=256)
-    parser.add_argument("--max-eval-instances", type=int, default=10)
+    parser.add_argument("--max-eval-instances", type=int, default=1)
     parser.add_argument("--num-req", type=int, default=100)
     parser.add_argument("--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1")
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     warmup = requests.post(
         url + "/generate",
         json={
-            "text": prompts[:20],
+            "text": prompts[:2],
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": 2,
@@ -154,7 +154,7 @@ if __name__ == "__main__":
     )
     print(warmup.json())
 
-    max_new_tokens = 50
+    max_new_tokens = 64
     max_padding_length = args.pad_len
     start = time.time()
     response = requests.post(
