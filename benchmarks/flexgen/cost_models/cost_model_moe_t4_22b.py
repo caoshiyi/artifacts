@@ -36,7 +36,6 @@ import numpy as np
 import pulp
 
 from flexgen.compression import CompressionConfig
-from flexgen.opt_config import get_opt_config
 from flexgen.flex_opt import Policy
 from flexgen.utils import GB, T
 from flexgen.flex_moe import get_config
@@ -51,7 +50,7 @@ class CostModelConfig:
     s: int = 512
     n: int = 32
 
-    l: int = 32
+    l: int = 32 # number of hidden layers 
     h1: int = 4096
     h2: int = 4096 * 4
     nh: int = 32
@@ -59,31 +58,29 @@ class CostModelConfig:
 
     n_experts: int = 8
 
-    # 15 * 204??
-    gmem: int = 24 * GB
-    cmem: int = 192 * GB
+    gmem: int = 16 * GB
+    cmem: int = 416 * GB
     nmem: int = 0 * GB
     
-    ctog_bdw: float = 5.4299 * GB
+    ctog_bdw: float = 4.7789 * GB
     gtoc_bdw_cache: float = 2.0151 * GB
     gtoc_bdw_hidden: float = 2.0151 * GB
 
     # TODO: differ than FlexGen default value for GCP T4
-    dtoc_bdw: float = 2.0151 * GB
+    dtoc_bdw: float = 2.0151 * GB  
     ctod_bdw_cache_p: float = 2.0151 * GB
     ctod_bdw_hidden_p: float = 2.0151 * GB
     ctod_bdw_g: float = 2.0151 * GB
 
-    mm_flops_p: float = 3.5068 * T
-    mm_flops_g: float = 1.4755 * T
-    bmm_flops_p: float = 1.3360 * T
-    bmm_flops_g: float = 0.9318 * T
-    cpu_flops: float = 4.4999 * T
+    mm_flops_p: float = 3.5124 * T
+    mm_flops_g: float = 1.3982 * T
+    bmm_flops_p: float = 1.3017 * T
+    bmm_flops_g: float = 0.9736 * T
+    cpu_flops: float = 4.4980 * T
     
     c1: float = 0.0000
-    c2: float = 0.0070 # 
+    c2: float = 0.0070  
     c3: float = 0.0000
-
 
 
 def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent=None):
@@ -162,6 +159,7 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
     h_kv = h1 // num_kv_group
     wi = 4 * h1 ** 2 + 4 * h1 ** 2 // num_kv_group + 6 * h1 * h2 * ne
     if compress_w:
+        print("Compressing weight")
         wi = wi / 4
 
     if debug:
@@ -217,8 +215,13 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
     prob += ctodp == (1 / ctod_bdw_cache_p) * 4 * bls * (s + 1) * h_kv * cn \
                    + (1 / ctod_bdw_hidden_p) * 2 * s * h1 * bls * hn
 
+    mm_flops_p_real = mm_flops_p * np.maximum(0.1,
+            1 + c1 * (max(0, math.log2(64 / gbs)) * max(0, math.log2(4096 / h1)))
+            - c2 * max(0, math.log2(64 / gbs))
+            - c3 * max(0, math.log2(4096 / h1)))     
+     
     # compp = gpu_compp
-    prob += compp == (1 / mm_flops_p) * bls * (4 * s * h1 ** 2 + 4 * s * h1 * h_kv  + 6 * s * h1 * h2) \
+    prob += compp == (1 / mm_flops_p_real) * bls * (4 * s * h1 ** 2 + 4 * s * h1 * h_kv  + 6 * s * h1 * h2) \
                      + (1 / bmm_flops_p) * 4 * bls * s ** 2 * h1
 
     # # Tgen = max(ctogg, gtocg, dtocg, ctodg, compg)
@@ -253,10 +256,27 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
     # compg = gpu_compg + cpu_compg
     # non-linear cpu_flops
     cpu_flops_real = cpu_flops * np.maximum(0.1,
-            1 + c1 * (max(0, math.log2(256 / gbs)) * max(0, math.log2(4096 / h1)))
-            - c2 * max(0, math.log2(256 / gbs))
+            1 + c1 * (max(0, math.log2(64 / gbs)) * max(0, math.log2(4096 / h1)))
+            - c2 * max(0, math.log2(64 / gbs))
             - c3 * max(0, math.log2(4096 / h1)))
-    prob += compg == (1 / mm_flops_g) * bls * (4 * h1 ** 2 + 4 * h1 * h_kv + 6 * h1 * h2) \
+    
+    mm_flops_g_real = mm_flops_g * np.maximum(0.1,
+            1 + c1 * (max(0, math.log2(64 / gbs)) * max(0, math.log2(4096 / h1)))
+            - c2 * max(0, math.log2(64 / gbs))
+            - c3 * max(0, math.log2(4096 / h1)))
+                 
+    # transformer: MLP layer - matrix multiplication 
+    # mm_flops_g: fit to machine of matrix multiplication peak performance (flops/s)
+    # x (flops) / mm_flops_g = time (s)
+    # MLP: (1 / mm_flops_g) * bls * (4 * h1 ** 2 + 4 * h1 * h_kv + 6 * h1 * h2)
+    
+    # Attention: (1 / bmm_flops_g) * 4 * bls * (s + n / 2) * h1 * cg
+    ## Batch multiplication, use GPU flops 
+    
+    # CPU attention: (1 / cpu_flops_real) * 4 * bls * (s + n / 2) * h1 * (cc + cn)
+    # Use CPU flops 
+    
+    prob += compg == (1 / mm_flops_g_real) * bls * (4 * h1 ** 2 + 4 * h1 * h_kv + 6 * h1 * h2) \
                      + (1 / bmm_flops_g) * 4 * bls * (s + n / 2) * h1 * cg \
                      + (1 / cpu_flops_real) * 4 * bls * (s + n / 2) * h1 * (cc + cn)
 
@@ -290,15 +310,26 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
     nvme_peak = pulp.LpVariable("nvme_peak", lowBound=0)
     
     ## GPU peak memory constaints
+    # model weights, activation weights, KV cache to store on GPU 
+    # percentage for each 
+    
+    # model weights (more on GPU, benefits more) --> comm time decreases 
+    
+    # gpu_home_p: store on GPU (always store on GPU: weights)
     prob += gpu_home_p == wi * l * wg + 2 * s * h1 * bls * hg + 4 * (s + n) * h_kv * bls * l * cg
+    
+    # interp: comp buffer 
     prob += interp == 8 * gbs * s * h1 \
                     + gbs * (2 * s * h1 + 2 * nh * s ** 2) \
                     + gbs * (2 * s * h1) \
                     + 4 * gbs * s * h1 \
                     + 2 * gbs * s * h2 \
                     + 2 * gbs * s * h1
+
+    # gpu_w_p: prefetch memory 
     prob += gpu_w_p == 2 * wi * (1 - wg) + 2 * s * h1 * gbs * (1 - hg) \
                      + interp
+                     
     # prob += (gpu_home_p * 1.2 + gpu_w_p) + 0.5 * GB <= gmem
     prob += gpu_home_p + gpu_w_p <= gmem
 
@@ -444,7 +475,6 @@ def solve_lp(config, bls, gbs, compress_w=False, verbose=1, debug=False, percent
                                           group_dim=2, symmetric=False))
     return status, policy, (throughput, tpre_tot, tgen_tot), (gpu_peak_p, gpu_peak_g)
 
-
 def get_nb_ub(config, gbs, solve_lp, compress_w=False, debug=None, percent=None):
     nb = 1
     while True:
@@ -544,7 +574,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--gpu-mem", type=int, default=16)
-    parser.add_argument("--cpu-mem", type=int, default=200)
+    parser.add_argument("--cpu-mem", type=int, default=416)
     parser.add_argument("--nvme-mem", type=int, default=0)
     
     parser.add_argument("--gbs", "--gpu-batch-size", type=int)
@@ -592,4 +622,3 @@ if __name__ == "__main__":
     best_policy, max_throughput = solve(config, solve_lp, vars(args))
     print(best_policy)
     print(f"max_throughput: {max_throughput:.2f} token/s")
- 
