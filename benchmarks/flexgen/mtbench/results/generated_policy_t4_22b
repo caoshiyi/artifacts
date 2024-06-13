@@ -1,0 +1,72 @@
+# Dataset: MTBench 
+
+########### CONFIG FROM PROFILING ############
+# python3 fit_cost_model_moe_22b.py 
+@dataclasses.dataclass
+class CostModelConfig:
+    s: int = 512
+    n: int = 32
+
+    l: int = 32 # number of hidden layers 
+    h1: int = 4096
+    h2: int = 4096 * 4
+    nh: int = 32
+    nkvh: int = 8
+
+    n_experts: int = 8
+
+    gmem: int = 16 * GB
+    cmem: int = 416 * GB
+    nmem: int = 0 * GB
+    
+    ctog_bdw: float = 4.7789 * GB
+    gtoc_bdw_cache: float = 2.0151 * GB
+    gtoc_bdw_hidden: float = 2.0151 * GB
+
+    # TODO: differ than FlexGen default value for GCP T4
+    dtoc_bdw: float = 2.0151 * GB  
+    ctod_bdw_cache_p: float = 2.0151 * GB
+    ctod_bdw_hidden_p: float = 2.0151 * GB
+    ctod_bdw_g: float = 2.0151 * GB
+
+    mm_flops_p: float = 3.5124 * T
+    mm_flops_g: float = 1.3982 * T
+    bmm_flops_p: float = 1.3017 * T
+    bmm_flops_g: float = 0.9736 * T
+    cpu_flops: float = 4.4980 * T
+    
+    c1: float = 0.0000
+    c2: float = 0.0070  
+    c3: float = 0.0000
+
+
+############# RESULTS ###############
+# NOTE: prompt-len = 147 (max) for 22b model; use a different tokenizer 
+
+# 1. GEN LEN = 32 
+# python3 cost_model_moe_t4_22b.py --gpu-mem 16 --cpu-mem 416 --nvme-mem 0 --prompt-len 417 --gen-len 32
+
+## Best Policy 
+Policy(gpu_batch_size=16, num_gpu_batches=46, w_gpu_percent=0.0089572274, w_cpu_percent=0.99104277, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 3.67 token/s
+
+# 2. GEN LEN = 64
+# python3 cost_model_moe_t4_22b.py --gpu-mem 16 --cpu-mem 416 --nvme-mem 0 --prompt-len 417 --gen-len 64
+
+## Best Policy 
+Policy(gpu_batch_size=4, num_gpu_batches=182, w_gpu_percent=0.012578038, w_cpu_percent=0.98742196, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 5.23 token/s
+
+# 3. GEN LEN = 128 
+# python3 cost_model_moe_t4_22b.py --gpu-mem 16 --cpu-mem 416 --nvme-mem 0 --prompt-len 417 --gen-len 128
+
+## Best Policy 
+Policy(gpu_batch_size=8, num_gpu_batches=80, w_gpu_percent=0.011371101, w_cpu_percent=0.9886289, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 6.31 token/s
+
+# 4. GEN LEN = 256 
+# python3 cost_model_moe_t4_22b.py --gpu-mem 16 --cpu-mem 416 --nvme-mem 0 --prompt-len 417 --gen-len 256
+
+## Best Policy 
+Policy(gpu_batch_size=2, num_gpu_batches=261, w_gpu_percent=0.013181506, w_cpu_percent=0.98681849, cache_gpu_percent=0.0, cache_cpu_percent=1.0, act_gpu_percent=0.0, act_cpu_percent=1.0, overlap=True, sep_layer=False, pin_weight=False, cpu_cache_compute=True, attn_sparsity=1, compress_weight=False, comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False, enabled=True), compress_cache=False, comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False, enabled=True))
+max_throughput: 6.36 token/s
