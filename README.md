@@ -7,6 +7,7 @@ conda activate fastmoe
 conda install onemkl-sycl-blas
 conda install mkl-include
 pip install -e .
+pip install triton==2.2.0
 ```
 
 ## Run tests

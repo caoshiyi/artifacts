@@ -37,6 +37,8 @@ def solve_lp(config, bls, gbs, verbose=1, stage="decode"):
     gpu_flops = config.gpu_flops
     cpu_flops = config.cpu_flops
 
+    tp_size = config.tp_size
+
     ## Create Problem
     prob = pulp.LpProblem('storage', sense=pulp.LpMinimize)
 
@@ -139,18 +141,18 @@ def solve_lp(config, bls, gbs, verbose=1, stage="decode"):
     ## GPU peak memory constaints
     prob += gpu_home >= gpu_home_p
     prob += gpu_home >= gpu_home_d
-    prob += gpu_home_d == w_other + wi * l * wg + 2 * 2 * h1 * bls + 4 * (s + n) * h_kv * bls * l * (cg + cc * gattn)
+    prob += gpu_home_d == w_other + wi * l * wg + 2 * 2 * h1 * bls * tp_size + 4 * (s + n) * h_kv * bls * l * (cg + cc * gattn)
     # weights + gpu_experts + kv_cache_gpu + hidden_states_buffer (2gbs:hidden+residual) + kvcahe buffer (2gbs)
     # L4+padding
     # prob += gpu_home_p == w_other + wi * l * wg + 4 * s * h_kv * bls * cg + 2 * 2 * h1 * gbs * 2 * s + 4 * s * h_kv * gbs * 2 * cc
     # t4 (currently residual is not offloaded to cpu, so it is included in the peak memory to avoid OOM for T4)
-    prob += gpu_home_p == w_other + wi * l * wg + 4 * s * h_kv * bls * cg + 2 * h1 * gbs * 2 * s + h1 * bls * 2 * s + 4 * s * h_kv * gbs * 2 * cc
+    prob += gpu_home_p == w_other + wi * l * wg + 4 * s * h_kv * bls * cg + tp_size * (2 * h1 * gbs * 2 * s + h1 * bls * 2 * s) + 4 * s * h_kv * gbs * 2 * cc
 
     # for the fused moe kernel
     # if stage == "decode":
     #     prob += inter == gbs * topk * h1 + gbs * topk * 3 * h2
     # elif stage == "prefill":
-    prob += inter == 2 * (gbs * topk * h1 * s + gbs * topk * 3 * h2 * s) * 1.2
+    prob += inter == 2 * (gbs * topk * h1 * tp_size * s + gbs * topk * 3 * h2 * s) * 1.2
     
     prob += gpu_w == 2 * wi * (1 - wg) + inter            
     prob += gpu_home + gpu_w <= gmem * 0.86
@@ -159,7 +161,8 @@ def solve_lp(config, bls, gbs, verbose=1, stage="decode"):
     # if stage == "decode":
     #     prob += cpu_home == wi * l * wc + 4 * (s + n) * h_kv * bls * l * cc
     # elif stage == "prefill":
-    prob += cpu_home == wi * l * wc + 4 * (s + n) * h_kv * bls * l * cc + 2 * h1 * bls * s
+    # fix this for tp: only one GPU offload hidden states
+    prob += cpu_home == wi * l * wc + 4 * (s + n) * h_kv * bls * l * cc + 2 * h1 * bls * s * tp_size
     # pinned memory for weights
     prob += cpu_w == wi * (1 - wg) * 2
     prob += cpu_home + cpu_w <= cmem * 0.8
@@ -188,6 +191,7 @@ def solve_lp(config, bls, gbs, verbose=1, stage="decode"):
     if verbose:
         print(f"status: {status}")
         print(f"weights size: {(w_other + wi * l) / GB:.4f} GB")
+        print(f"non-experts weights size: {(w_other) / GB:.4f} GB")
         print(f"ctog = {pulp.value(ctog):.4f} s  "
               f"gpu_T = {pulp.value(gpu_T):.4f} s  "
               f"cpu_T = {pulp.value(cpu_T):.4f} s")

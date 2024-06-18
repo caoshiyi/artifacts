@@ -93,7 +93,7 @@ class MixtralMoE(nn.Module):
             param_data[layer_id, expert_id,
                        w3_offset : w2_offset] = loaded_weight[shard, :].view(-1)
         if weight_name.endswith("w2.weight"):
-            param_data[layer_id, expert_id, w2_offset:] = loaded_weight[:, shard].view(-1)
+            param_data[layer_id, expert_id, w2_offset:] = loaded_weight[:, shard].reshape(-1)
 
     def forward(self, index:int, hidden_states: torch.Tensor, experts_cache: torch.Tensor) -> torch.Tensor:
         # router_logits: (n_token, n_experts)
@@ -347,6 +347,7 @@ class MixtralForCausalLMOff(nn.Module):
         self.model = MixtralModel(config, linear_method)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+        self.tp_size = get_tensor_model_parallel_world_size()
         # self.current_experts = []
 
     def forward(
@@ -360,7 +361,7 @@ class MixtralForCausalLMOff(nn.Module):
     ) -> torch.Tensor:
         if input_metadata.decode_part == DecodePart.ALL or input_metadata.decode_part == DecodePart.POSTATTN:
             if hidden_states is not None:
-                hidden_states = hidden_states.view(-1, self.config.hidden_size)
+                hidden_states = hidden_states.view(hidden_states.shape[0], -1)
             hidden_states, residual = self.model(input_ids, positions,
                                     input_metadata, hidden_states=hidden_states, residual=residual, cur_layers=cur_layers)
         elif input_metadata.decode_part == DecodePart.PREATTN:

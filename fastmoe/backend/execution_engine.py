@@ -205,7 +205,8 @@ class ExecutionEngine:
                     None
             )
             with torch.cuda.stream(self.context.load_stream):
-                self.context.experts_cache.view(-1, self.model_config.intermediate_size)[prefetch_gpu_slice, :].copy_(self.context.experts_pin.view(-1, self.model_config.intermediate_size)[from_pin_slice, :], non_blocking=True)
+                intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
+                self.context.experts_cache.view(-1, intermediate_size)[prefetch_gpu_slice, :].copy_(self.context.experts_pin.view(-1, intermediate_size)[from_pin_slice, :], non_blocking=True)
                 self.prefetch_events[slot_id].record(self.context.prefetch_stream)
     
     def prefetch_experts_to_pin(self, layer_id: int, slot_id: int):
@@ -213,13 +214,14 @@ class ExecutionEngine:
 
     def prefetch_experts_to_pin_func(self, layer_id: int, slot_id: int):
         self.prefetch_events[slot_id].synchronize()
-
+        
+        intermediate_size = self.model_config.intermediate_size // self.hardware_config.tp_size
         experts_pin = self.context.experts_pin.view(-1, 
-                                                    self.model_config.intermediate_size)
+                                                    intermediate_size)
         experts_cpu = (self.model_runner.model.get_experts_mem()
                        .view(self.model_config.num_hidden_layers, 
                             -1, 
-                            self.model_config.intermediate_size))
+                            intermediate_size))
         prefetch_cpu_slice = self._get_prefetch_cpu_slice(slot_id, 'decode')
         if slot_id != self.num_weights_slots_decode - 1:
             to_pin_slice = slice(
@@ -487,7 +489,7 @@ class ExecutionContext:
         print(f"Policy: {policy}")
         # # hack
         # policy.ubs = 8
-        # policy.n_ub = 36
+        # policy.n_ub = 39
         
         # allocate mem for the context
         ubs = policy.ubs
@@ -514,10 +516,11 @@ class ExecutionContext:
         # if we have enough GPU memory, the buffer is 2 * (num_experts - num_experts_gpu)
         # elif we do not have enough GPU memory, the buffer is of size 2 * num_comp_experts
         experts_pool_size  = num_layers * num_experts_gpu + 2 * (num_comp_experts - num_experts_gpu)
-        experts_cache = torch.empty(experts_pool_size, 3 * model_config.intermediate_size * model_config.hidden_size, dtype=torch.get_default_dtype(), device="cuda")
+        intermediate_size = model_config.intermediate_size // hardware_config.tp_size
+        experts_cache = torch.empty(experts_pool_size, 3 * intermediate_size * model_config.hidden_size, dtype=torch.get_default_dtype(), device="cuda")
 
         experts_pin = torch.empty(((num_comp_experts - num_experts_gpu), 
-                                    3 * model_config.intermediate_size * model_config.hidden_size), 
+                                    3 * intermediate_size * model_config.hidden_size), 
                                     dtype=torch.get_default_dtype(), device="cpu").pin_memory()
 
         num_q_heads = model_config.num_attention_heads // hardware_config.tp_size

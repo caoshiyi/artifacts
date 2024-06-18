@@ -84,6 +84,8 @@ class CostModelConfig:
     gpu_flops: float = 104 * T
     cpu_flops: float = 13 * T
 
+    tp_size: int = 1
+
     @classmethod
     def init(cls, model_config: ModelConfig, hardware_config: HardwareConfig, prompt_len, gen_len):
         tp_size = hardware_config.tp_size
@@ -103,7 +105,8 @@ class CostModelConfig:
             g_bdw=hardware_config.g_bdw * tp_size,
             c_bdw=hardware_config.c_bdw,
             gpu_flops=hardware_config.gpu_flops * tp_size,
-            cpu_flops=hardware_config.cpu_flops
+            cpu_flops=hardware_config.cpu_flops,
+            tp_size=tp_size
         )
     
 def dtype_size(dtype):

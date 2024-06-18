@@ -1,0 +1,4 @@
+{"time": 2493.3146238327026, "throughput": 34.03661904070003, "max_new_tokens": 32, "max_padding_length": 0}
+{"time": 4684.061406612396, "throughput": 36.23522094744496, "max_new_tokens": 64, "max_padding_length": 0}
+{"time": 9680.286110401154, "throughput": 29.671850266014197, "max_new_tokens": 128, "max_padding_length": 0}
+{"time": 13302.368262529373, "throughput": 25.864868060311696, "max_new_tokens": 256, "max_padding_length": 0}

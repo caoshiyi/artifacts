@@ -164,6 +164,7 @@ class ModelRpcServer(rpyc.Service):
         decode_step = 0
         num_decode_steps = self.exe_engine.context.gen_len - 1 if num_mb > 1 else 1
         while decode_step < num_decode_steps:
+            print("decode step: ", decode_step)
             self.exe_engine.prepare_for_decode()
             # Prologue
             for k, ub in enumerate(self.exe_engine.micro_batches[:2]):
