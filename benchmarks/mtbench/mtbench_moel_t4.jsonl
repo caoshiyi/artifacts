@@ -1,4 +1,5 @@
 {"time": 1571.8958959579468, "throughput": 63.04743224716158, "max_new_tokens": 32, "max_padding_length": 0}
 {"time": 1956.0939304828644, "throughput": 101.32846736612086, "max_new_tokens": 64, "max_padding_length": 0}
-{"time": 2689.1485307216644, "throughput": 108.62025531985495, "max_new_tokens": 128, "max_padding_length": 0}
+{"time": 3007.002599477768, "throughput": 97.73453473270695, "max_new_tokens": 128, "max_padding_length": 0}
 {"time": 3924.566378593445, "throughput": 96.86675248342938, "max_new_tokens": 256, "max_padding_length": 0}
+
