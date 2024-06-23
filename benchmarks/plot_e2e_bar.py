@@ -30,7 +30,7 @@ def plot_e2e_single(dataset, model, device):
             'FlexGen(c)': [9.8, 9.4, 7.2, 6.8],
             'DeepSpeed-Zero': [7.1,7.6,7.8,6.7],
             'MoE-Lightning(p)': [15.6, 24, 30.1, 33.9],
-            'MoE-Lightning': [63.0, 101.3, 108.6, 96.7]
+            'MoE-Lightning': [63.0, 101.3, 97.73, 96.7]
         }
     elif device == "s6":
         throughputs = {
@@ -57,11 +57,11 @@ def plot_e2e_single(dataset, model, device):
     group_width = 0.85  # Total width of each group, a good default is 0.8 to 0.9
     width = group_width / n_baselines  # the width of the bars
 
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(14, 7))
 
     # Calculate the maximum non-MoE throughput for each generation length
     max_non_moe_throughput = np.maximum.reduce([throughputs[key] for key in throughputs if "MoE-Lightning" not in key])
-    max_throughput = max(max(values) for values in throughputs.values())*1.1
+    max_throughput = max(max(values) for values in throughputs.values())*1.2
 
     # Create bars using a loop and annotate
     for i, (label, values) in enumerate(throughputs.items()):
@@ -82,19 +82,21 @@ def plot_e2e_single(dataset, model, device):
                 speedup = height / max_non_moe_throughput[j]
                 ax.annotate(f'{speedup:.1f}x',
                             xy=(rect.get_x() + rect.get_width() / 2, height),
-                            xytext=(0, 18),  # 3 points vertical offset
+                            xytext=(0, 19),  # 3 points vertical offset
                             textcoords="offset points",
                             ha='center', va='bottom', 
                             color='red', fontweight='bold',fontsize=anno_fontsize)
 
     # Add some text for labels, title and custom x-axis tick labels, etc.
     ax.set_xlabel('Generation Length', fontsize=label_fontsize, fontweight='bold')
+    if device == "s8_9" or device == "s1" or device == "s6":
+        ax.set_ylabel('Throughput (tokens/s)', fontsize=label_fontsize, fontweight='bold')
     # ax.set_ylabel('Throughput (tokens/s)', fontsize=label_fontsize, fontweight='bold')
     plt.tick_params(axis='both', which='major', labelsize=tick_fontsize)
     plt.ylim(0, max_throughput)
     ax.set_xticks(x)
     ax.set_xticklabels(generation_lengths)
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.24), ncol=3, fontsize=legend_fontsize)
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.25), ncol=3, fontsize=legend_fontsize)
 
     # Adding a grid for better readability
     ax.set_axisbelow(True)
