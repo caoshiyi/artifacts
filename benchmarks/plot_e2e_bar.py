@@ -5,7 +5,7 @@ import argparse
 def plot_e2e_single(dataset, model, device):
     label_fontsize = 32
     tick_fontsize = 28
-    legend_fontsize = 20  # Larger legend font size
+    legend_fontsize = 24  # Larger legend font size
     anno_fontsize = 18
 
     # Data
