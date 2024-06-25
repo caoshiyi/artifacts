@@ -3,12 +3,12 @@ import matplotlib.pyplot as plt
 from utils import MLP_flops, MLP_bytes, attention_flops, attention_bytes
 from scipy.interpolate import interp1d
 
-label_fontsize = 32
+label_fontsize = 20
 tick_fontsize = 16
 legend_fontsize = 14  # Larger legend font size
 anno_fontsize = 16
 
-normal_linewidth = 2
+normal_linewidth = 3
 
 # System specifications
 cpu_mem_bandwidth = 100  # GB/s
@@ -46,9 +46,9 @@ mlp_ideal_performance_values = [min(gpu_mem_bandwidth * oi, gpu_peak_flops) for 
 
 # Setup plot
 plt.figure(figsize=(10, 7))
-plt.loglog(oi, cpu_ceiling, label='CPU Mem Bdw', linestyle='-', color='blue')
-plt.loglog(oi, gpu_ceiling, label='GPU Mem Bdw', linestyle='-', color='green')
-plt.loglog(oi, cpu_gpu_ceiling, label='CPU-GPU Mem Bdw', linestyle='-', color='red')
+plt.loglog(oi, cpu_ceiling, label='CPU Mem Bdw', linestyle='-', color='blue', linewidth=normal_linewidth)
+plt.loglog(oi, gpu_ceiling, label='GPU Mem Bdw', linestyle='-', color='green', linewidth=normal_linewidth)
+plt.loglog(oi, cpu_gpu_ceiling, label='CPU-GPU Mem Bdw', linestyle='-', color='red', linewidth=normal_linewidth)
 
 # Add horizontal lines for peak FLOPS
 plt.axhline(y=cpu_peak_flops, color='blue', linestyle='--', label='CPU Peak FLOPS', linewidth=normal_linewidth)

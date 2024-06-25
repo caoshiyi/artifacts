@@ -43,6 +43,11 @@ def plot_e2e_all(dataset, model, devices):
 
     for idx, device in enumerate(devices):
         throughputs = device_throughputs[device]
+        
+        # round to 1 decimal of throughputs 
+        for key in throughputs:
+            throughputs[key] = [round(val, 1) for val in throughputs[key]]
+            
         x = np.arange(len(generation_lengths))  # the label locations
         n_baselines = len(throughputs)
         group_width = 0.85  # Total width of each group
