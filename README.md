@@ -4,6 +4,11 @@ This document contains instruction for ASPLOS 2025 artifact evaluation for the p
 Memory-constrained GPUs*. 
 
 ## Artifact Overview 
+In this artifact, we propose a high-throughput MoE batch infer-ence system, MoE-Lightning, that significantly outperforms
+SOTA baselines. MoE-Lightning introduces a novel CPU-GPU-I/O pipelining schedule, *CGOPipe*, with paged weights to achieve
+high resource utilization, and a performance model, *HRM*, based on a Hierarchical Roofline Model we introduce to help
+find policies with higher throughput than existing systems.
+
 
 ## Installation 
 ```
