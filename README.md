@@ -1,4 +1,11 @@
-## Install
+# MoE-Lightning: Artifact Evaluation
+
+This document contains instruction for ASPLOS 2025 artifact evaluation for the paper *MoE-Lightning: High-Throughput MoE Inference on
+Memory-constrained GPUs*. 
+
+## Artifact Overview 
+
+## Installation 
 ```
 git clone https://github.com/caoshiyi/FastMoE.git
 cd FastMoE
