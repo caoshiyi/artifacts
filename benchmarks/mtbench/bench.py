@@ -2,11 +2,15 @@ import argparse
 import json
 import requests
 import time
+import math
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--ubs", type=int, default=0)
+    parser.add_argument("--n-ub", type=int, default=0)
     args = parser.parse_args()
 
     url = f"{args.host}:{args.port}"
@@ -21,7 +25,7 @@ if __name__ == "__main__":
     
     questions = load_questions("./question.jsonl")
     prompts = []
-    for i in range(59):
+    for i in range(math.ceil(args.ubs*args.n_ub//80)):
         for question in questions:
                 prompts.append(question["turns"][0])
 
@@ -38,9 +42,8 @@ if __name__ == "__main__":
             "max_padding_length": 0,
         },
     )
-    print(warmup.json())
 
-    max_new_tokens = 32
+    max_new_tokens = args.max_new_tokens
     max_padding_length = 0
     start = time.time()
     response = requests.post(
@@ -56,8 +59,6 @@ if __name__ == "__main__":
         },
     )
     end = time.time()
-    # save the result, create the file if it doesn't exist
-    print(response.json())
     num_finished = 0
     for req in response.json():
          if req['meta_info']['completion_tokens'] == max_new_tokens:
