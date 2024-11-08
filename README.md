@@ -67,10 +67,3 @@ On GCP T4 (48vCPU + 192 CPU Mem) instance (S1), we have:
 --gen-len 128: --ubs 164 --n-ub 14
 --gen-len 256: --ubs 100 --n-ub 15
 ```
-
-## Run tests (HELM) 
-```
-python -m fastmoe.serve.launch_server --model-path mistralai/Mixtral-8x7B-Instruct-v0.1 --port 30000 --cpu-mem-bdw 76 --avg-prompt-len 256 --gen-len 50
-cd benchmarks/helm 
-python bench.py --port 30000
-```
