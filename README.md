@@ -12,7 +12,7 @@ find policies with higher throughput than existing systems.
 
 ## Installation 
 ```
-git clone https://github.com/caoshiyi/FastMoE.git
+git clone -b asplos-artifact https://github.com/caoshiyi/FastMoE.git 
 cd FastMoE
 conda create -n fastmoe python=3.11
 conda activate fastmoe
