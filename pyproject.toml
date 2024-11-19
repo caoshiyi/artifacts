@@ -15,6 +15,7 @@ dependencies = [
     "aiohttp", "fastapi", "psutil", "rpyc", "torch", "uvloop", "uvicorn",
        "zmq", "vllm>=0.2.7, <0.4.1", "interegular", "lark", "numba",
        "pydantic", "referencing", "diskcache", "cloudpickle", "pillow","pulp",
+       "numpy==1.26.4",
 ]
 
 [tool.setuptools.packages.find]

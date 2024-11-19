@@ -16,8 +16,8 @@ git clone -b asplos-artifact https://github.com/caoshiyi/FastMoE.git
 cd FastMoE
 conda create -n fastmoe python=3.11
 conda activate fastmoe
-conda install onemkl-sycl-blas
-conda install mkl-include
+conda install -c https://software.repos.intel.com/python/conda/ -c conda-forge onemkl-sycl-blas
+conda install -c https://software.repos.intel.com/python/conda/ -c conda-forge mkl-include
 pip install -e .
 pip install triton==2.2.0
 ```
@@ -67,3 +67,5 @@ On GCP T4 (48vCPU + 192 CPU Mem) instance (S1), we have:
 --gen-len 128: --ubs 164 --n-ub 14
 --gen-len 256: --ubs 100 --n-ub 15
 ```
+
+You may observe some variances on the generated policies. In that case, just use the generated policies to run the benchmarking.
