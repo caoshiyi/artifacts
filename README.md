@@ -1,1 +1,1 @@
-# Artifatcs for papers
+# Artifacts for papers
